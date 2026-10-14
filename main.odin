@@ -13,40 +13,32 @@ MBAP_Header :: struct {
 	unit_id:        u8,
 }
 
-parse_mbap_header :: proc(message: []u8) -> (MBAP_Header, bool) {
+MBAP_ParserError :: enum {
+	None,
+	InsufficientLength,
+	InvalidProtocolId,
+	InvalidLength,
+}
+
+parse_mbap_header :: proc(message: []u8) -> (MBAP_Header, MBAP_ParserError) {
 
 	if len(message) < MBAP_HEADER_SIZE {
 		log.errorf("Expected a length of %v but got %v", MBAP_HEADER_SIZE, len(message))
-		return {}, false
+		return {}, .InsufficientLength
 	}
 
-	transaction_id, transaction_ok := endian.get_u16(message[0:2], .Big)
-	if !transaction_ok {
-		log.errorf("cannot read transaction id from message")
-		return {}, false
-	}
-
-	protocol_id, protocol_ok := endian.get_u16(message[2:4], .Big)
-	if !protocol_ok {
-		log.errorf("cannot read protocol id from message")
-		return {}, false
-	}
+	transaction_id, _ := endian.get_u16(message[0:2], .Big)
+	protocol_id, _ := endian.get_u16(message[2:4], .Big)
+	length, _ := endian.get_u16(message[4:6], .Big)
 
 	if protocol_id != 0 {
 		log.errorf("invalid protocol id indicated by the header")
-		return {}, false
+		return {}, .InvalidProtocolId
 	}
-
-	length, length_ok := endian.get_u16(message[4:6], .Big)
-	if !length_ok {
-		log.errorf("cannot read length from message")
-		return {}, false
-	}
-
 
 	if length < 2 || length > 254 {
 		log.errorf("length field has an invalid size")
-		return {}, false
+		return {}, .InvalidLength
 	}
 
 	return MBAP_Header {
@@ -55,11 +47,111 @@ parse_mbap_header :: proc(message: []u8) -> (MBAP_Header, bool) {
 			length = length,
 			unit_id = message[6],
 		},
-		true
+		.None
 }
 
-handle_message :: proc(message: []u8) {
-	log.infof("Raw Message: %v", message[:])
+ModbusPayload :: struct {
+	header:        MBAP_Header,
+	function_code: u8,
+	args:          ModbusRequest,
+	// ...
+}
+
+ReadHoldingRegister :: struct {
+	start_address: u16,
+	quantity:      u16,
+}
+
+ModbusRequest :: union {
+	ReadHoldingRegister,
+}
+
+ModbusException :: enum {
+	None,
+	IllegalFunction,
+	IllegalDataAddress,
+	IllegalDataValue,
+	DeviceFailure,
+	Acknowledged,
+	DeviceBusy,
+	ParityError,
+	GatewayUnavailable,
+	GatewayFailedToRespond,
+	FatalMessageTooShort,
+}
+
+modbus_parse_payload :: proc(
+	header: MBAP_Header,
+	message: []u8,
+) -> (
+	ModbusPayload,
+	ModbusException,
+) {
+	result: ModbusPayload = {
+		header        = header,
+		function_code = message[7],
+	}
+
+	switch result.function_code {
+	case 3:
+		{
+			if len(message) < 12 {
+				log.info("Insufficient Bytes received to parse FC3")
+				return {}, .FatalMessageTooShort
+			}
+
+			start_address, _ := endian.get_u16(message[8:10], .Big)
+			quantity, _ := endian.get_u16(message[10:12], .Big)
+
+			//NOTE: According to the specification, the server can
+			// throw an exeception if the address value is out of range
+			// but in reality the range is 0x0000 to 0xFFFF which can
+			// never happen in the first place. The quantity however still
+			// needs to be checked to be less than or equal 0x7D.
+			if quantity > 0x7D {
+				return {}, .IllegalDataValue
+			}
+
+			result.args = ReadHoldingRegister {
+				start_address = start_address,
+				quantity      = quantity,
+			}
+		}
+	case:
+		{
+			return {}, .IllegalFunction
+		}
+	}
+
+	return result, .None
+}
+
+modbus_generate_exception_answer :: proc(exception: ModbusException) {
+
+}
+
+ModbusResponse :: struct {
+	function_code: u8,
+}
+
+ModbusParserError :: enum {
+	None,
+}
+
+handle_message :: proc(message: []u8) -> (ModbusResponse, ModbusParserError) {
+	log.debugf("Raw Message: %v", message[:])
+
+	header, _ := parse_mbap_header(message)
+	log.infof("Header of Received Message: %v", header)
+
+	payload, exception := modbus_parse_payload(header, message)
+
+	if exception != .None {
+		modbus_generate_exception_answer(exception)
+	}
+
+	log.infof("Payload: %v", payload)
+	return {}, .None
 }
 
 MBAP_HEADER_SIZE :: 7
@@ -77,7 +169,7 @@ validate_message :: proc(raw_message: []u8) -> (int, MessageState) {
 
 	header, header_valid := parse_mbap_header(raw_message[:MBAP_HEADER_SIZE])
 
-	if !header_valid {
+	if header_valid != .None {
 		return -1, .Invalid
 	}
 
