@@ -6,6 +6,7 @@ import "core:net"
 import "core:os"
 import "core:testing"
 import "core:thread"
+import "core:time"
 
 MBAP_Header :: struct {
 	transaction_id: u16,
@@ -89,11 +90,22 @@ validate_message :: proc(raw_message: []u8) -> (int, MessageState) {
 	return frame_size, .Validated
 }
 
+TcpConnection :: struct {
+	connection: net.TCP_Socket,
+	timeout:    int,
+	buffer:     [512]u8,
+	length:     int,
+}
 handle_connection :: proc(connection: net.TCP_Socket) {
 	message_buffer: [512]u8
 	message_length: int = 0
+	timeout: time.Duration = 5 * time.Second
+
 	//NOTE: Close the connection once the transaction completes
 	defer net.close(connection)
+
+	//TODO: The timeout is for recv_tcp it does not measure the time it takes to get the whole frame. This is something i should take into consideration
+	net.set_option(connection, .Receive_Timeout, timeout)
 
 	for {
 		bytes_received, err_received := net.recv_tcp(connection, message_buffer[message_length:])
