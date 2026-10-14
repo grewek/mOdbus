@@ -16,7 +16,7 @@ MBAP_Header :: struct {
 
 parse_mbap_header :: proc(message: []u8) -> (MBAP_Header, bool) {
 
-	if len(message) < size_of(MBAP_Header) {
+	if len(message) < 7 {
 		log.errorf("Expected a length of %v but got %v", size_of(MBAP_Header), message)
 		return {}, false
 	}
@@ -44,7 +44,7 @@ parse_mbap_header :: proc(message: []u8) -> (MBAP_Header, bool) {
 		return {}, false
 	}
 
-	if length > 253 {
+	if length > 254 {
 		log.errorf("length field has an invalid size")
 		return {}, false
 	}
@@ -58,203 +58,81 @@ parse_mbap_header :: proc(message: []u8) -> (MBAP_Header, bool) {
 		true
 }
 
-handle_message :: proc(header: MBAP_Header, message: []u8) {
-	log.infof("Header Info: %v", header)
+handle_message :: proc(message: []u8) {
+	log.infof("Raw Message: %v", message[:])
 }
 
-RingBuffer :: struct {
-	data:           [512]u8,
-	filled:         bool,
-	read_position:  int,
-	write_position: int,
+MBAP_HEADER_SIZE :: 7
+
+MessageState :: enum {
+	Validated,
+	Incomplete,
+	Invalid,
 }
-
-ring_buffer_length :: proc(ring_buffer: ^RingBuffer) -> int {
-	assert(ring_buffer.write_position >= 0 && ring_buffer.write_position < 512)
-	assert(ring_buffer.read_position >= 0 && ring_buffer.read_position < 512)
-
-	if ring_buffer.filled {
-		return len(ring_buffer.data)
+validate_message :: proc(raw_message: []u8) -> (int, MessageState) {
+	if len(raw_message) <= MBAP_HEADER_SIZE {
+		return -1, .Incomplete
 	}
 
-	return ((ring_buffer.write_position - ring_buffer.read_position) + 512) % 512
-}
+	header, header_valid := parse_mbap_header(raw_message[:MBAP_HEADER_SIZE])
 
-@(test)
-test_ring_buffer_length :: proc(t: ^testing.T) {
-	buffer := RingBuffer {
-		filled         = false,
-		read_position  = 0,
-		write_position = 0,
+	if !header_valid {
+		return -1, .Invalid
 	}
 
-	testing.expect_value(t, ring_buffer_length(&buffer), 0)
-
-	buffer.read_position = 0
-	buffer.write_position = 1
-	testing.expect_value(t, ring_buffer_length(&buffer), 1)
-
-	buffer.read_position = 0
-	buffer.write_position = 2
-	testing.expect_value(t, ring_buffer_length(&buffer), 2)
-
-	buffer.read_position = 10
-	buffer.write_position = 511
-	testing.expect_value(t, ring_buffer_length(&buffer), 501)
-
-	buffer.read_position = 500
-	buffer.write_position = 10
-	testing.expect_value(t, ring_buffer_length(&buffer), 22)
-
-	buffer.filled = true
-	buffer.read_position = 128
-	buffer.write_position = 128
-	testing.expect_value(t, ring_buffer_length(&buffer), 512)
-
-	buffer.filled = false
-	buffer.read_position = 128
-	buffer.write_position = 128
-	testing.expect_value(t, ring_buffer_length(&buffer), 0)
-}
-
-RingBufferError :: enum {
-	None,
-	InsufficientSpace,
-}
-
-ring_buffer_write :: proc(ring_buffer: ^RingBuffer, data: []u8) -> RingBufferError {
-
-	if len(data) == 0 {
-		return .None
+	frame_size := (MBAP_HEADER_SIZE - 1) + int(header.length)
+	if len(raw_message) < frame_size {
+		return -1, .Incomplete
 	}
 
-	if ring_buffer.filled {
-		return .InsufficientSpace
-	}
-	available_slots := 512 - ring_buffer_length(ring_buffer)
-	if available_slots < len(data) {
-		return .InsufficientSpace
-	}
 
-	for value in data {
-		ring_buffer.data[ring_buffer.write_position] = value
-		ring_buffer.write_position += 1
-
-
-		if ring_buffer.write_position >= 512 {
-			ring_buffer.write_position = 0
-		}
-	}
-
-	if ring_buffer.write_position == ring_buffer.read_position {
-		ring_buffer.filled = true
-	}
-
-	return .None
-}
-
-@(test)
-test_ring_buffer_writes_correctly :: proc(t: ^testing.T) {
-	buffer := RingBuffer {
-		filled         = false,
-		read_position  = 0,
-		write_position = 0,
-	}
-
-	data_slice_empty := []u8{}
-
-	result_a := ring_buffer_write(&buffer, data_slice_empty[:])
-
-	testing.expect_value(t, result_a, .None)
-	testing.expect_value(t, buffer.write_position, 0)
-
-	data_slice_one := []u8{0x01, 0x02, 0x03, 0x04}
-
-	result_b := ring_buffer_write(&buffer, data_slice_one[:])
-
-	testing.expect_value(t, result_b, .None)
-	testing.expect_value(t, buffer.data[0], 1)
-	testing.expect_value(t, buffer.data[1], 2)
-	testing.expect_value(t, buffer.data[2], 3)
-	testing.expect_value(t, buffer.data[3], 4)
-	testing.expect_value(t, buffer.write_position, 4)
-
-	data_slice_two := []u8{0x05, 0x06, 0x07, 0x08, 0x09, 0x0A}
-
-	result_c := ring_buffer_write(&buffer, data_slice_two[:])
-
-	testing.expect_value(t, result_c, .None)
-	testing.expect_value(t, buffer.data[4], 5)
-	testing.expect_value(t, buffer.data[5], 6)
-	testing.expect_value(t, buffer.data[6], 7)
-	testing.expect_value(t, buffer.data[7], 8)
-	testing.expect_value(t, buffer.data[8], 9)
-	testing.expect_value(t, buffer.data[9], 10)
-	testing.expect_value(t, buffer.write_position, 10)
-
-	buffer.read_position = 2
-	buffer.write_position = 510
-
-	result_d := ring_buffer_write(&buffer, data_slice_two[:])
-
-	testing.expect_value(t, result_d, .InsufficientSpace)
-
-	buffer.filled = true
-	buffer.write_position = 20
-	buffer.read_position = 20
-
-	result_e := ring_buffer_write(&buffer, data_slice_two[:])
-	testing.expect_value(t, result_e, .InsufficientSpace)
-
-	buffer.filled = false
-	buffer.write_position = 0
-	buffer.read_position = 0
-
-
-	data := [512]u8{}
-	for value, idx in 0 ..< 512 {
-		data[idx] = u8(value)
-	}
-
-	result_f := ring_buffer_write(&buffer, data[:])
-	testing.expect_value(t, result_f, .None)
-
-}
-
-ring_buffer_read :: proc(ring_buffer: ^RingBuffer) -> []u8 {
-	return ring_buffer.data[:]
+	return frame_size, .Validated
 }
 
 handle_connection :: proc(connection: net.TCP_Socket) {
 	message_buffer: [512]u8
-	total_received := 0
+	message_length: int = 0
+	//NOTE: Close the connection once the transaction completes
+	defer net.close(connection)
 
 	for {
-		bytes_received, err_received := net.recv_tcp(connection, message_buffer[:])
+		bytes_received, err_received := net.recv_tcp(connection, message_buffer[message_length:])
+		message_length += bytes_received
 
-		if err_received != nil {
+		log.infof("Received data with length of %v", message_length)
+		if err_received != .None {
 			log.errorf("failed to receive data: %v", err_received)
-		}
-
-		received := message_buffer[:bytes_received]
-		total_received += bytes_received
-
-		if len(received) == 0 {
-			log.infof("client disconnected")
 			break
 		}
 
-		header, ok := parse_mbap_header(received)
-
-		if !ok {
-			log.error("Client send invalid header closing connection")
+		if bytes_received == 0 {
+			log.info("client closed connection")
 			break
 		}
 
-		handle_message(header, message_buffer[:7])
+		for {
+			frame_size, frame_valid := validate_message(message_buffer[0:message_length])
 
+			if frame_valid == .Incomplete {
+				break
+			}
 
-		log.infof("Server received [%d bytes]: %v", bytes_received, received)
+			if frame_valid == .Invalid {
+				log.info("Received invalid frame, server is closing connection")
+				return
+			}
+
+			if frame_valid == .Validated {
+				log.infof(
+					"Server received [%d bytes]: %v",
+					bytes_received,
+					message_buffer[:frame_size],
+				)
+				handle_message(message_buffer[:frame_size])
+				copy_slice(message_buffer[0:], message_buffer[frame_size:message_length])
+				message_length -= frame_size
+			}
+		}
 	}
 }
 
@@ -293,7 +171,7 @@ main :: proc() {
 			log.info("Connection accepted")
 		}
 
-		thread.create_and_start_with_poly_data(incoming_connection, handle_connection, context)
+		handle_connection(incoming_connection)
 	}
 
 	defer net.close(sock)
