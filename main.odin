@@ -267,6 +267,36 @@ TcpConnection :: struct {
 	buffer_length: int,
 }
 
+modbus_response_to_frame_buffer :: proc(response: ModbusResponseMessage, frame_buffer: []u8) {
+	if len(frame_buffer) < int(response.header.length) + MBAP_HEADER_SIZE {
+		log.infof("cannot convert message into frame, buffer length too small")
+	}
+
+	transaction_id_bytes := []u8 {
+		u8(response.header.transaction_id & u16(0x00FF)),
+		u8((response.header.transaction_id >> 16) & 0x00FF),
+	}
+
+	protocol_id_bytes := []u8 {
+		u8(response.header.protocol_id & u16(0x00FF)),
+		u8((response.header.protocol_id >> 16) & 0x00FF),
+	}
+
+	length_bytes := []u8 {
+		u8(response.header.length & u16(0x00FF)),
+		u8((response.header.length >> 16) & 0x00FF),
+	}
+
+	copy(frame_buffer[0:], transaction_id_bytes[0:])
+	copy(frame_buffer[2:], protocol_id_bytes[0:])
+	copy(frame_buffer[4:], length_bytes[0:])
+
+	frame_buffer[5] = response.header.unit_id
+	frame_buffer[6] = response.function_code
+
+	//TODO: Marshal the Payload into the frame_buffer
+}
+
 handle_connection :: proc(connection: ^TcpConnection) {
 	//TODO: The timeout is for recv_tcp it does not measure the time it takes to get the whole frame. This is something i should take into consideration
 	sock_option_error := net.set_option(connection.socket, .Receive_Timeout, connection.timeout)
@@ -317,7 +347,11 @@ handle_connection :: proc(connection: ^TcpConnection) {
 					frame_size,
 					connection.buffer[:frame_size],
 				)
-				handle_message(connection.buffer[:frame_size])
+				response, err := handle_message(connection.buffer[:frame_size])
+
+				response_frame := modbus_response_to_frame_buffer(response)
+
+				net.send_tcp(connection.socket, response_frame[:])
 				copy_slice(
 					connection.buffer[0:],
 					connection.buffer[frame_size:connection.buffer_length],
