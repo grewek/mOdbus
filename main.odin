@@ -267,7 +267,10 @@ TcpConnection :: struct {
 	buffer_length: int,
 }
 
-modbus_response_to_frame_buffer :: proc(response: ModbusResponseMessage, frame_buffer: []u8) {
+modbus_response_to_frame_buffer :: proc(
+	response: ModbusResponseMessage,
+	frame_buffer: []u8,
+) -> int {
 	if len(frame_buffer) < int(response.header.length) + MBAP_HEADER_SIZE {
 		log.infof("cannot convert message into frame, buffer length too small")
 	}
@@ -295,6 +298,9 @@ modbus_response_to_frame_buffer :: proc(response: ModbusResponseMessage, frame_b
 	frame_buffer[6] = response.function_code
 
 	//TODO: Marshal the Payload into the frame_buffer
+
+	//TODO: For now we assume that we have written the complete frame
+	return int(response.header.length) + MBAP_HEADER_SIZE
 }
 
 handle_connection :: proc(connection: ^TcpConnection) {
@@ -349,9 +355,10 @@ handle_connection :: proc(connection: ^TcpConnection) {
 				)
 				response, err := handle_message(connection.buffer[:frame_size])
 
-				response_frame := modbus_response_to_frame_buffer(response)
+				response_frame_buffer := [260]u8{}
+				frame_size := modbus_response_to_frame_buffer(response, response_frame_buffer[:])
 
-				net.send_tcp(connection.socket, response_frame[:])
+				net.send_tcp(connection.socket, response_frame_buffer[frame_size:])
 				copy_slice(
 					connection.buffer[0:],
 					connection.buffer[frame_size:connection.buffer_length],
