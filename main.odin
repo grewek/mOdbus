@@ -50,11 +50,17 @@ parse_mbap_header :: proc(message: []u8) -> (MBAP_Header, MBAP_ParserError) {
 		.None
 }
 
-ModbusPayload :: struct {
+ModbusRequestMessage :: struct {
 	header:        MBAP_Header,
 	function_code: u8,
-	args:          ModbusRequest,
+	args:          ModbusRequestPayload,
 	// ...
+}
+
+ModbusResponseMessage :: struct {
+	header:        MBAP_Header,
+	function_code: u8,
+	args:          ModbusResponsePayload,
 }
 
 ReadHoldingRegister :: struct {
@@ -62,95 +68,167 @@ ReadHoldingRegister :: struct {
 	quantity:      u16,
 }
 
-ModbusRequest :: union {
+ModbusRequestPayload :: union {
 	ReadHoldingRegister,
 }
 
-ModbusException :: enum {
-	None,
-	IllegalFunction,
-	IllegalDataAddress,
-	IllegalDataValue,
-	DeviceFailure,
-	Acknowledged,
-	DeviceBusy,
-	ParityError,
-	GatewayUnavailable,
-	GatewayFailedToRespond,
-	FatalMessageTooShort,
+ModbusResponsePayload :: union {
+	ModbusException,
 }
 
-modbus_parse_payload :: proc(
-	header: MBAP_Header,
-	message: []u8,
-) -> (
-	ModbusPayload,
-	ModbusException,
-) {
-	result: ModbusPayload = {
-		header        = header,
-		function_code = message[7],
+ModbusException :: struct {
+	exception_code: u8,
+}
+
+ModbusParserError :: enum {
+	None = 0x00,
+	UnknownFunctionCode,
+	IllegalDataAddress,
+	IllegalDataValue,
+	MessageTooShort,
+}
+
+ModbusExceptionCode :: enum {
+	IllegalFunction        = 0x01,
+	IllegalDataAddress     = 0x02,
+	IllegalDataValue       = 0x03,
+	DeviceFailure          = 0x04,
+	Acknowledged           = 0x05,
+	DeviceBusy             = 0x06,
+	ParityError            = 0x08,
+	GatewayUnavailable     = 0x0A,
+	GatewayFailedToRespond = 0x0B,
+}
+
+FUNCTION_CODE_READ_HOLDING_REGISTERS :: 3
+
+ModbusParserErrorMetadata :: struct {
+	header:        MBAP_Header,
+	function_code: u8,
+	parser_error:  ModbusParserError,
+}
+
+ModbusParserOperationResult :: union {
+	ModbusRequestMessage,
+	ModbusParserErrorMetadata,
+}
+
+FUNCTION_CODE_OFFSET_IN_MESSAGE :: 7
+
+ADDRESS_FIELD_OFFSET_IN_MESSAGE :: 8
+ADDRESS_FIELD_SIZE_IN_MESSAGE :: 2
+
+QUANTITY_FIELD_OFFSET_IN_MESSAGE :: 10
+QUANTITY_FIELD_SIZE_IN_MESSAGE :: 2
+
+modbus_parser_error_to_exception :: proc(parser_error: ModbusParserError) -> ModbusExceptionCode {
+	switch parser_error {
+	case .None:
+		assert(false, "unreachable code reached")
+	case .MessageTooShort:
+		assert(false, "unreachable code reached")
+	case .UnknownFunctionCode:
+		return .IllegalFunction
+	case .IllegalDataAddress:
+		return .IllegalDataAddress
+	case .IllegalDataValue:
+		return .IllegalDataValue
+	case:
+		assert(
+			false,
+			"unreachable code reached due to calling the function with values that can't be converted into an exception",
+		)
 	}
 
-	switch result.function_code {
-	case 3:
+	return nil
+}
+modbus_parse_payload :: proc(header: MBAP_Header, message: []u8) -> ModbusParserOperationResult {
+	fc := message[FUNCTION_CODE_OFFSET_IN_MESSAGE]
+	switch fc {
+	case FUNCTION_CODE_READ_HOLDING_REGISTERS:
 		{
 			if len(message) < 12 {
 				log.info("Insufficient Bytes received to parse FC3")
-				return {}, .FatalMessageTooShort
+				return ModbusParserErrorMetadata {
+					header = header,
+					function_code = fc,
+					parser_error = .MessageTooShort,
+				}
 			}
 
-			start_address, _ := endian.get_u16(message[8:10], .Big)
-			quantity, _ := endian.get_u16(message[10:12], .Big)
+			raw_address := message[ADDRESS_FIELD_OFFSET_IN_MESSAGE:(ADDRESS_FIELD_OFFSET_IN_MESSAGE +
+				ADDRESS_FIELD_SIZE_IN_MESSAGE)]
+			start_address, _ := endian.get_u16(raw_address, .Big)
+
+			raw_quantity := message[QUANTITY_FIELD_OFFSET_IN_MESSAGE:(QUANTITY_FIELD_OFFSET_IN_MESSAGE +
+				QUANTITY_FIELD_SIZE_IN_MESSAGE)]
+			quantity, _ := endian.get_u16(raw_quantity, .Big)
 
 			//NOTE: According to the specification, the server can
 			// throw an exeception if the address value is out of range
 			// but in reality the range is 0x0000 to 0xFFFF which can
 			// never happen in the first place. The quantity however still
 			// needs to be checked to be less than or equal 0x7D.
-			if quantity > 0x7D {
-				return {}, .IllegalDataValue
+			if quantity == 0 || quantity > 0x7D {
+				return ModbusParserErrorMetadata {
+					header = header,
+					function_code = fc,
+					parser_error = .IllegalDataValue,
+				}
 			}
 
-			result.args = ReadHoldingRegister {
-				start_address = start_address,
-				quantity      = quantity,
+			return ModbusRequestMessage {
+				header = header,
+				function_code = fc,
+				args = ReadHoldingRegister{start_address = start_address, quantity = quantity},
 			}
 		}
 	case:
 		{
-			return {}, .IllegalFunction
+			return ModbusParserErrorMetadata {
+				header = header,
+				function_code = fc,
+				parser_error = .UnknownFunctionCode,
+			}
 		}
 	}
-
-	return result, .None
 }
 
-modbus_generate_exception_answer :: proc(exception: ModbusException) {
+modbus_generate_exception_answer :: proc(
+	request: ModbusParserErrorMetadata,
+) -> ModbusResponseMessage {
 
+	exception_value := modbus_parser_error_to_exception(request.parser_error)
+	response := ModbusResponseMessage {
+		header = request.header,
+		function_code = request.function_code | 0x80,
+		args = ModbusException{exception_code = u8(exception_value)},
+	}
+
+	return response
 }
 
-ModbusResponse :: struct {
-	function_code: u8,
-}
 
-ModbusParserError :: enum {
-	None,
-}
-
-handle_message :: proc(message: []u8) -> (ModbusResponse, ModbusParserError) {
+handle_message :: proc(message: []u8) -> (ModbusResponseMessage, ModbusParserError) {
 	log.debugf("Raw Message: %v", message[:])
 
 	header, _ := parse_mbap_header(message)
 	log.infof("Header of Received Message: %v", header)
 
-	payload, exception := modbus_parse_payload(header, message)
+	payload_result := modbus_parse_payload(header, message)
 
-	if exception != .None {
-		modbus_generate_exception_answer(exception)
+	switch result in payload_result {
+	case ModbusRequestMessage:
+		log.infof("Payload: %v", result)
+		assert(false, "TODO: Handle the success case")
+	case ModbusParserErrorMetadata:
+		if result.parser_error == .MessageTooShort {
+			return {}, result.parser_error
+		} else {
+			return modbus_generate_exception_answer(result), .None
+		}
 	}
 
-	log.infof("Payload: %v", payload)
 	return {}, .None
 }
 
