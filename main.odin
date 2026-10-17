@@ -53,6 +53,18 @@ MAXIMUM_HEADER_LENGTH :: 254
 
 MODBUS_TCP_MAX_FRAME_SIZE :: 260
 
+TcpConnection :: struct {
+	socket:        net.TCP_Socket,
+	timeout:       time.Duration,
+	// A Frame that is received by a TCP Socket can only contain a maximum
+	// of 260 bytes, which means that this buffer can house one frame in
+	// the worst case.
+	// NOTE: __check__ that if we use async or threads later
+	// there is no way for the user to write data behind the buffer.
+	buffer:        [512]u8,
+	buffer_length: int,
+}
+
 ModbusHeader :: struct {
 	transaction_id: u16,
 	protocol_id:    u16,
@@ -105,6 +117,23 @@ ModbusParserError :: enum {
 	MessageTooShort,
 }
 
+ModbusParserErrorMetadata :: struct {
+	header:        ModbusHeader,
+	function_code: u8,
+	parser_error:  ModbusParserError,
+}
+
+ModbusParserOperationResult :: union {
+	ModbusRequestMessage,
+	ModbusParserErrorMetadata,
+}
+
+MessageState :: enum {
+	Validated,
+	Incomplete,
+	Invalid,
+}
+
 ModbusExceptionCode :: enum {
 	IllegalFunction        = 0x01,
 	IllegalDataAddress     = 0x02,
@@ -117,16 +146,6 @@ ModbusExceptionCode :: enum {
 	GatewayFailedToRespond = 0x0B,
 }
 
-ModbusParserErrorMetadata :: struct {
-	header:        ModbusHeader,
-	function_code: u8,
-	parser_error:  ModbusParserError,
-}
-
-ModbusParserOperationResult :: union {
-	ModbusRequestMessage,
-	ModbusParserErrorMetadata,
-}
 
 parse_mbap_header :: proc(message: []u8) -> (ModbusHeader, FrameError) {
 
@@ -281,13 +300,6 @@ handle_message :: proc(message: []u8) -> (ModbusResponseMessage, ModbusParserErr
 	return {}, .None
 }
 
-
-MessageState :: enum {
-	Validated,
-	Incomplete,
-	Invalid,
-}
-
 validate_message :: proc(raw_message: []u8) -> (int, MessageState) {
 	if len(raw_message) < MBAP_HEADER_SIZE {
 		return -1, .Incomplete
@@ -308,17 +320,6 @@ validate_message :: proc(raw_message: []u8) -> (int, MessageState) {
 	return frame_size, .Validated
 }
 
-TcpConnection :: struct {
-	socket:        net.TCP_Socket,
-	timeout:       time.Duration,
-	// A Frame that is received by a TCP Socket can only contain a maximum
-	// of 260 bytes, which means that this buffer can house one frame in
-	// the worst case.
-	// NOTE: __check__ that if we use async or threads later
-	// there is no way for the user to write data behind the buffer.
-	buffer:        [512]u8,
-	buffer_length: int,
-}
 
 modbus_payload_to_frame_buffer :: proc(modbus_payload: ModbusResponsePayload, frame_buffer: []u8) {
 	switch payload in modbus_payload {
