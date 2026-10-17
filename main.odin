@@ -6,59 +6,76 @@ import "core:net"
 import "core:os"
 import "core:time"
 
-MBAP_Header :: struct {
+//data offsets in request payloads and size of data if the data is one byte in size there is only an address
+
+TRANSACTION_ID_OFFSET_IN_FRAME :: 0
+TRANSACTION_ID_SIZE_IN_FRAME :: 2
+
+PROTOCOL_ID_OFFSET_IN_FRAME :: 2
+PROTOCOL_ID_SIZE_IN_FRAME :: 2
+
+LENGTH_FIELD_OFFSET_IN_FRAME :: 4
+LENGTH_FIELD_SIZE_IN_FRAME :: 2
+
+UNIT_ID_OFFSET_IN_FRAME :: 6
+FUNCTION_CODE_OFFSET_IN_FRAME :: 7
+
+ADDRESS_FIELD_OFFSET_IN_FRAME :: 8
+ADDRESS_FIELD_SIZE_IN_FRAME :: 2
+
+EXCEPTION_FIELD_OFFSET_IN_FRAME :: 8
+
+QUANTITY_FIELD_OFFSET_IN_FRAME :: 10
+QUANTITY_FIELD_SIZE_IN_FRAME :: 2
+
+//length of modbus response payloads with a known static size
+MODBUS_EXCEPTION_FRAME_PAYLOAD_LENGTH :: 3
+
+//constants for known minimum and maximum values inside a message
+MODBUS_HOLDING_REGISTERS_MINIMUM_QUANTITY :: 1
+MODBUS_HOLDING_REGISTERS_MAXIMUM_QUANTITY :: 125
+
+//constants for known request messages sizes that need to be at least n bytes long
+MINIMUM_FRAME_LENGTH_FC3_REQUEST :: 12
+
+
+//constants for known function codes
+FUNCTION_CODE_READ_HOLDING_REGISTERS :: 3
+
+//constants for necessary header values
+MBAP_HEADER_SIZE :: 7
+
+MODBUS_PROTOCOL_ID :: 0
+
+MINIMUM_HEADER_LENGTH :: 2
+MAXIMUM_HEADER_LENGTH :: 254
+
+
+MODBUS_TCP_MAX_FRAME_SIZE :: 260
+
+ModbusHeader :: struct {
 	transaction_id: u16,
 	protocol_id:    u16,
 	length:         u16,
 	unit_id:        u8,
 }
 
-MBAP_ParserError :: enum {
+FrameError :: enum {
 	None,
 	InsufficientLength,
 	InvalidProtocolId,
 	InvalidLength,
 }
 
-parse_mbap_header :: proc(message: []u8) -> (MBAP_Header, MBAP_ParserError) {
-
-	if len(message) < MBAP_HEADER_SIZE {
-		log.errorf("Expected a length of %v but got %v", MBAP_HEADER_SIZE, len(message))
-		return {}, .InsufficientLength
-	}
-
-	transaction_id, _ := endian.get_u16(message[0:2], .Big)
-	protocol_id, _ := endian.get_u16(message[2:4], .Big)
-	length, _ := endian.get_u16(message[4:6], .Big)
-
-	if protocol_id != 0 {
-		log.errorf("invalid protocol id indicated by the header")
-		return {}, .InvalidProtocolId
-	}
-
-	if length < 2 || length > 254 {
-		log.errorf("length field has an invalid size")
-		return {}, .InvalidLength
-	}
-
-	return MBAP_Header {
-			transaction_id = transaction_id,
-			protocol_id = protocol_id,
-			length = length,
-			unit_id = message[6],
-		},
-		.None
-}
-
 ModbusRequestMessage :: struct {
-	header:        MBAP_Header,
+	header:        ModbusHeader,
 	function_code: u8,
 	args:          ModbusRequestPayload,
 	// ...
 }
 
 ModbusResponseMessage :: struct {
-	header:        MBAP_Header,
+	header:        ModbusHeader,
 	function_code: u8,
 	args:          ModbusResponsePayload,
 }
@@ -100,10 +117,8 @@ ModbusExceptionCode :: enum {
 	GatewayFailedToRespond = 0x0B,
 }
 
-FUNCTION_CODE_READ_HOLDING_REGISTERS :: 3
-
 ModbusParserErrorMetadata :: struct {
-	header:        MBAP_Header,
+	header:        ModbusHeader,
 	function_code: u8,
 	parser_error:  ModbusParserError,
 }
@@ -113,20 +128,55 @@ ModbusParserOperationResult :: union {
 	ModbusParserErrorMetadata,
 }
 
-FUNCTION_CODE_OFFSET_IN_MESSAGE :: 7
+parse_mbap_header :: proc(message: []u8) -> (ModbusHeader, FrameError) {
 
-ADDRESS_FIELD_OFFSET_IN_MESSAGE :: 8
-ADDRESS_FIELD_SIZE_IN_MESSAGE :: 2
+	if len(message) < MBAP_HEADER_SIZE {
+		log.errorf("Expected a length of %v but got %v", MBAP_HEADER_SIZE, len(message))
+		return {}, .InsufficientLength
+	}
 
-QUANTITY_FIELD_OFFSET_IN_MESSAGE :: 10
-QUANTITY_FIELD_SIZE_IN_MESSAGE :: 2
+	transaction_id, _ := endian.get_u16(
+		message[TRANSACTION_ID_OFFSET_IN_FRAME:(TRANSACTION_ID_OFFSET_IN_FRAME +
+			TRANSACTION_ID_SIZE_IN_FRAME)],
+		.Big,
+	)
+	protocol_id, _ := endian.get_u16(
+		message[PROTOCOL_ID_OFFSET_IN_FRAME:(PROTOCOL_ID_OFFSET_IN_FRAME +
+			PROTOCOL_ID_SIZE_IN_FRAME)],
+		.Big,
+	)
+	length, _ := endian.get_u16(
+		message[LENGTH_FIELD_OFFSET_IN_FRAME:(LENGTH_FIELD_OFFSET_IN_FRAME +
+			LENGTH_FIELD_SIZE_IN_FRAME)],
+		.Big,
+	)
+
+	if protocol_id != MODBUS_PROTOCOL_ID {
+		log.errorf("invalid protocol id indicated by the header")
+		return {}, .InvalidProtocolId
+	}
+
+	if length < MINIMUM_HEADER_LENGTH || length > MAXIMUM_HEADER_LENGTH {
+		log.errorf("length field has an invalid size")
+		return {}, .InvalidLength
+	}
+
+	return ModbusHeader {
+			transaction_id = transaction_id,
+			protocol_id = protocol_id,
+			length = length,
+			unit_id = message[UNIT_ID_OFFSET_IN_FRAME],
+		},
+		.None
+}
+
 
 modbus_parser_error_to_exception :: proc(parser_error: ModbusParserError) -> ModbusExceptionCode {
 	switch parser_error {
 	case .None:
-		assert(false, "unreachable code reached")
+		fallthrough
 	case .MessageTooShort:
-		assert(false, "unreachable code reached")
+		unreachable()
 	case .UnknownFunctionCode:
 		return .IllegalFunction
 	case .IllegalDataAddress:
@@ -134,20 +184,15 @@ modbus_parser_error_to_exception :: proc(parser_error: ModbusParserError) -> Mod
 	case .IllegalDataValue:
 		return .IllegalDataValue
 	case:
-		assert(
-			false,
-			"unreachable code reached due to calling the function with values that can't be converted into an exception",
-		)
+		unreachable()
 	}
-
-	return nil
 }
-modbus_parse_payload :: proc(header: MBAP_Header, message: []u8) -> ModbusParserOperationResult {
-	fc := message[FUNCTION_CODE_OFFSET_IN_MESSAGE]
+modbus_parse_payload :: proc(header: ModbusHeader, message: []u8) -> ModbusParserOperationResult {
+	fc := message[FUNCTION_CODE_OFFSET_IN_FRAME]
 	switch fc {
 	case FUNCTION_CODE_READ_HOLDING_REGISTERS:
 		{
-			if len(message) < 12 {
+			if len(message) < MINIMUM_FRAME_LENGTH_FC3_REQUEST {
 				log.info("Insufficient Bytes received to parse FC3")
 				return ModbusParserErrorMetadata {
 					header = header,
@@ -156,20 +201,21 @@ modbus_parse_payload :: proc(header: MBAP_Header, message: []u8) -> ModbusParser
 				}
 			}
 
-			raw_address := message[ADDRESS_FIELD_OFFSET_IN_MESSAGE:(ADDRESS_FIELD_OFFSET_IN_MESSAGE +
-				ADDRESS_FIELD_SIZE_IN_MESSAGE)]
+			raw_address := message[ADDRESS_FIELD_OFFSET_IN_FRAME:(ADDRESS_FIELD_OFFSET_IN_FRAME +
+				ADDRESS_FIELD_SIZE_IN_FRAME)]
 			start_address, _ := endian.get_u16(raw_address, .Big)
 
-			raw_quantity := message[QUANTITY_FIELD_OFFSET_IN_MESSAGE:(QUANTITY_FIELD_OFFSET_IN_MESSAGE +
-				QUANTITY_FIELD_SIZE_IN_MESSAGE)]
+			raw_quantity := message[QUANTITY_FIELD_OFFSET_IN_FRAME:(QUANTITY_FIELD_OFFSET_IN_FRAME +
+				QUANTITY_FIELD_SIZE_IN_FRAME)]
 			quantity, _ := endian.get_u16(raw_quantity, .Big)
 
 			//NOTE: According to the specification, the server can
-			// throw an exeception if the address value is out of range
+			// throw an exception if the address value is out of range
 			// but in reality the range is 0x0000 to 0xFFFF which can
 			// never happen in the first place. The quantity however still
 			// needs to be checked to be less than or equal 0x7D.
-			if quantity == 0 || quantity > 0x7D {
+			if quantity < MODBUS_HOLDING_REGISTERS_MINIMUM_QUANTITY ||
+			   quantity > MODBUS_HOLDING_REGISTERS_MAXIMUM_QUANTITY {
 				return ModbusParserErrorMetadata {
 					header = header,
 					function_code = fc,
@@ -184,15 +230,14 @@ modbus_parse_payload :: proc(header: MBAP_Header, message: []u8) -> ModbusParser
 			}
 		}
 	case:
-		{
-			return ModbusParserErrorMetadata {
-				header = header,
-				function_code = fc,
-				parser_error = .UnknownFunctionCode,
-			}
+		return ModbusParserErrorMetadata {
+			header = header,
+			function_code = fc,
+			parser_error = .UnknownFunctionCode,
 		}
 	}
 }
+
 
 modbus_generate_exception_answer :: proc(
 	request: ModbusParserErrorMetadata,
@@ -205,6 +250,7 @@ modbus_generate_exception_answer :: proc(
 		args = ModbusException{exception_code = u8(exception_value)},
 	}
 
+	response.header.length = MODBUS_EXCEPTION_FRAME_PAYLOAD_LENGTH
 	return response
 }
 
@@ -212,6 +258,9 @@ modbus_generate_exception_answer :: proc(
 handle_message :: proc(message: []u8) -> (ModbusResponseMessage, ModbusParserError) {
 	log.debugf("Raw Message: %v", message[:])
 
+	//NOTE: All fields of the header contained in the frame were already
+	//      checked when the message was received so we don't need to check
+	//      that again.
 	header, _ := parse_mbap_header(message)
 	log.infof("Header of Received Message: %v", header)
 
@@ -232,7 +281,6 @@ handle_message :: proc(message: []u8) -> (ModbusResponseMessage, ModbusParserErr
 	return {}, .None
 }
 
-MBAP_HEADER_SIZE :: 7
 
 MessageState :: enum {
 	Validated,
@@ -263,8 +311,20 @@ validate_message :: proc(raw_message: []u8) -> (int, MessageState) {
 TcpConnection :: struct {
 	socket:        net.TCP_Socket,
 	timeout:       time.Duration,
+	// A Frame that is received by a TCP Socket can only contain a maximum
+	// of 260 bytes, which means that this buffer can house one frame in
+	// the worst case.
+	// NOTE: __check__ that if we use async or threads later
+	// there is no way for the user to write data behind the buffer.
 	buffer:        [512]u8,
 	buffer_length: int,
+}
+
+modbus_payload_to_frame_buffer :: proc(modbus_payload: ModbusResponsePayload, frame_buffer: []u8) {
+	switch payload in modbus_payload {
+	case ModbusException:
+		frame_buffer[EXCEPTION_FIELD_OFFSET_IN_FRAME] = payload.exception_code
+	}
 }
 
 modbus_response_to_frame_buffer :: proc(
@@ -273,34 +333,41 @@ modbus_response_to_frame_buffer :: proc(
 ) -> int {
 	if len(frame_buffer) < int(response.header.length) + MBAP_HEADER_SIZE {
 		log.infof("cannot convert message into frame, buffer length too small")
+		return -1
 	}
 
-	transaction_id_bytes := []u8 {
-		u8(response.header.transaction_id & u16(0x00FF)),
-		u8((response.header.transaction_id >> 16) & 0x00FF),
+	if ok := endian.put_u16(
+		frame_buffer[TRANSACTION_ID_OFFSET_IN_FRAME:],
+		.Big,
+		response.header.transaction_id,
+	); !ok {
+		log.info("cannot write transaction id into response frame")
+		return -1
+	}
+	if ok := endian.put_u16(
+		frame_buffer[PROTOCOL_ID_OFFSET_IN_FRAME:],
+		.Big,
+		response.header.protocol_id,
+	); !ok {
+		log.info("cannot write protocol id into response frame")
+		return -1
+	}
+	if ok := endian.put_u16(
+		frame_buffer[LENGTH_FIELD_OFFSET_IN_FRAME:],
+		.Big,
+		response.header.length,
+	); !ok {
+		log.info("cannot write length into response frame")
+		return -1
 	}
 
-	protocol_id_bytes := []u8 {
-		u8(response.header.protocol_id & u16(0x00FF)),
-		u8((response.header.protocol_id >> 16) & 0x00FF),
-	}
+	frame_buffer[UNIT_ID_OFFSET_IN_FRAME] = response.header.unit_id
+	frame_buffer[FUNCTION_CODE_OFFSET_IN_FRAME] = response.function_code
 
-	length_bytes := []u8 {
-		u8(response.header.length & u16(0x00FF)),
-		u8((response.header.length >> 16) & 0x00FF),
-	}
-
-	copy(frame_buffer[0:], transaction_id_bytes[0:])
-	copy(frame_buffer[2:], protocol_id_bytes[0:])
-	copy(frame_buffer[4:], length_bytes[0:])
-
-	frame_buffer[5] = response.header.unit_id
-	frame_buffer[6] = response.function_code
-
-	//TODO: Marshal the Payload into the frame_buffer
+	modbus_payload_to_frame_buffer(response.args, frame_buffer)
 
 	//TODO: For now we assume that we have written the complete frame
-	return int(response.header.length) + MBAP_HEADER_SIZE
+	return int(response.header.length) + (MBAP_HEADER_SIZE - 1)
 }
 
 handle_connection :: proc(connection: ^TcpConnection) {
@@ -355,10 +422,43 @@ handle_connection :: proc(connection: ^TcpConnection) {
 				)
 				response, err := handle_message(connection.buffer[:frame_size])
 
-				response_frame_buffer := [260]u8{}
-				frame_size := modbus_response_to_frame_buffer(response, response_frame_buffer[:])
+				if err == .MessageTooShort {
+					log.info("frame is too short parser refused to consume message")
+					return
+				}
 
-				net.send_tcp(connection.socket, response_frame_buffer[frame_size:])
+				response_frame_buffer := [MODBUS_TCP_MAX_FRAME_SIZE]u8{}
+				response_frame_size := modbus_response_to_frame_buffer(
+					response,
+					response_frame_buffer[:],
+				)
+
+				if response_frame_size == -1 {
+					log.error("response could not be built due to errors closing connection")
+					return
+				}
+
+				byte_send_count: int = 0
+				for byte_send_count < response_frame_size {
+					bytes_send, send_error := net.send_tcp(
+						connection.socket,
+						response_frame_buffer[byte_send_count:response_frame_size],
+					)
+					if send_error != .None {
+						log.error("cannot send data disconnecting client")
+						return
+					}
+
+					if bytes_send == 0 {
+						log.error("could not send data, disconnecting client")
+						return
+					}
+
+
+					byte_send_count += bytes_send
+				}
+
+
 				copy_slice(
 					connection.buffer[0:],
 					connection.buffer[frame_size:connection.buffer_length],
@@ -401,7 +501,7 @@ main :: proc() {
 	for {
 		incoming_connection, from, err_accept := net.accept_tcp(sock)
 
-		if err_accept != nil {
+		if err_accept != .None {
 			log.errorf("connection refused reason: %v", err_accept)
 			continue
 		} else {
@@ -416,7 +516,7 @@ main :: proc() {
 			buffer_length = 0,
 		}
 
-		defer net.close(incoming_connection)
 		handle_connection(&connection)
+		net.close(incoming_connection)
 	}
 }
