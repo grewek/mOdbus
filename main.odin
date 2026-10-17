@@ -72,7 +72,7 @@ ModbusHeader :: struct {
 	unit_id:        u8,
 }
 
-FrameError :: enum {
+FrameHeaderError :: enum {
 	None,
 	InsufficientLength,
 	InvalidProtocolId,
@@ -146,8 +146,22 @@ ModbusExceptionCode :: enum {
 	GatewayFailedToRespond = 0x0B,
 }
 
+FrameWriterError :: enum {
+	None,
+	InsufficientCapacity,
+	WriteFailure,
+}
 
-parse_mbap_header :: proc(message: []u8) -> (ModbusHeader, FrameError) {
+ConnectionAction :: enum {
+	Continue,
+	CloseInvalid,
+	CloseMissingBytes,
+	CloseSendFailed,
+	CloseInternalError,
+}
+
+
+parse_mbap_header :: proc(message: []u8) -> (ModbusHeader, FrameHeaderError) {
 
 	if len(message) < MBAP_HEADER_SIZE {
 		log.errorf("Expected a length of %v but got %v", MBAP_HEADER_SIZE, len(message))
@@ -328,13 +342,17 @@ modbus_payload_to_frame_buffer :: proc(modbus_payload: ModbusResponsePayload, fr
 	}
 }
 
+
 modbus_response_to_frame_buffer :: proc(
 	response: ModbusResponseMessage,
 	frame_buffer: []u8,
-) -> int {
+) -> (
+	int,
+	FrameWriterError,
+) {
 	if len(frame_buffer) < int(response.header.length) + MBAP_HEADER_SIZE {
 		log.infof("cannot convert message into frame, buffer length too small")
-		return -1
+		return 0, .InsufficientCapacity
 	}
 
 	if ok := endian.put_u16(
@@ -343,7 +361,7 @@ modbus_response_to_frame_buffer :: proc(
 		response.header.transaction_id,
 	); !ok {
 		log.info("cannot write transaction id into response frame")
-		return -1
+		return 0, .WriteFailure
 	}
 	if ok := endian.put_u16(
 		frame_buffer[PROTOCOL_ID_OFFSET_IN_FRAME:],
@@ -351,7 +369,7 @@ modbus_response_to_frame_buffer :: proc(
 		response.header.protocol_id,
 	); !ok {
 		log.info("cannot write protocol id into response frame")
-		return -1
+		return 0, .WriteFailure
 	}
 	if ok := endian.put_u16(
 		frame_buffer[LENGTH_FIELD_OFFSET_IN_FRAME:],
@@ -359,7 +377,7 @@ modbus_response_to_frame_buffer :: proc(
 		response.header.length,
 	); !ok {
 		log.info("cannot write length into response frame")
-		return -1
+		return 0, .WriteFailure
 	}
 
 	frame_buffer[UNIT_ID_OFFSET_IN_FRAME] = response.header.unit_id
@@ -368,7 +386,77 @@ modbus_response_to_frame_buffer :: proc(
 	modbus_payload_to_frame_buffer(response.args, frame_buffer)
 
 	//TODO: For now we assume that we have written the complete frame
-	return int(response.header.length) + (MBAP_HEADER_SIZE - 1)
+	return (int(response.header.length) + (MBAP_HEADER_SIZE - 1)), .None
+}
+
+process_received_frame :: proc(connection: ^TcpConnection) -> ConnectionAction {
+	for {
+		frame_size, frame_valid := validate_message(connection.buffer[0:connection.buffer_length])
+
+		if frame_valid == .Incomplete {
+			return .Continue
+		}
+
+		if frame_valid == .Invalid {
+			log.info("Received invalid frame, server is closing connection")
+			return .CloseInvalid
+		}
+
+		if frame_valid == .Validated {
+			log.infof("Server received [%d bytes]: %v", frame_size, connection.buffer[:frame_size])
+			response, err := handle_message(connection.buffer[:frame_size])
+
+			if err == .MessageTooShort {
+				log.info("frame is too short parser refused to consume message")
+				return .CloseMissingBytes
+			}
+
+			frame_buffer := [MODBUS_TCP_MAX_FRAME_SIZE]u8{}
+			frame_length, frame_writer_error := modbus_response_to_frame_buffer(
+				response,
+				frame_buffer[:],
+			)
+
+			if frame_writer_error != .None {
+				return .CloseInternalError
+			}
+
+			send_succeeded := tcp_send_modbus_frame(frame_buffer[:frame_length], connection)
+
+			if !send_succeeded {
+				log.info("failed to send data, disconnecting client")
+				return .CloseSendFailed
+			}
+
+			copy_slice(
+				connection.buffer[0:],
+				connection.buffer[frame_size:connection.buffer_length],
+			)
+			connection.buffer_length -= frame_size
+		}
+	}
+}
+
+
+tcp_send_modbus_frame :: proc(frame: []u8, connection: ^TcpConnection) -> bool {
+	byte_send_count: int = 0
+	for byte_send_count < len(frame) {
+		bytes_send, send_error := net.send_tcp(connection.socket, frame[byte_send_count:])
+		if send_error != .None {
+			log.error("cannot send data")
+			return false
+		}
+
+		if bytes_send == 0 {
+			log.error("could not send data, disconnecting client")
+			return false
+		}
+
+
+		byte_send_count += bytes_send
+	}
+
+	return true
 }
 
 handle_connection :: proc(connection: ^TcpConnection) {
@@ -401,71 +489,11 @@ handle_connection :: proc(connection: ^TcpConnection) {
 			break
 		}
 
-		for {
-			frame_size, frame_valid := validate_message(
-				connection.buffer[0:connection.buffer_length],
-			)
+		processing_state := process_received_frame(connection)
 
-			if frame_valid == .Incomplete {
-				break
-			}
-
-			if frame_valid == .Invalid {
-				log.info("Received invalid frame, server is closing connection")
-				return
-			}
-
-			if frame_valid == .Validated {
-				log.infof(
-					"Server received [%d bytes]: %v",
-					frame_size,
-					connection.buffer[:frame_size],
-				)
-				response, err := handle_message(connection.buffer[:frame_size])
-
-				if err == .MessageTooShort {
-					log.info("frame is too short parser refused to consume message")
-					return
-				}
-
-				response_frame_buffer := [MODBUS_TCP_MAX_FRAME_SIZE]u8{}
-				response_frame_size := modbus_response_to_frame_buffer(
-					response,
-					response_frame_buffer[:],
-				)
-
-				if response_frame_size == -1 {
-					log.error("response could not be built due to errors closing connection")
-					return
-				}
-
-				byte_send_count: int = 0
-				for byte_send_count < response_frame_size {
-					bytes_send, send_error := net.send_tcp(
-						connection.socket,
-						response_frame_buffer[byte_send_count:response_frame_size],
-					)
-					if send_error != .None {
-						log.error("cannot send data disconnecting client")
-						return
-					}
-
-					if bytes_send == 0 {
-						log.error("could not send data, disconnecting client")
-						return
-					}
-
-
-					byte_send_count += bytes_send
-				}
-
-
-				copy_slice(
-					connection.buffer[0:],
-					connection.buffer[frame_size:connection.buffer_length],
-				)
-				connection.buffer_length -= frame_size
-			}
+		if processing_state != .Continue {
+			log.errorf("error occurred while processing the modbus frame: %v", processing_state)
+			break
 		}
 	}
 }
