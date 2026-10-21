@@ -39,6 +39,7 @@ FUNCTION_CODE_READ_HOLDING_REGISTERS :: 3
 
 //constants for necessary header values
 MBAP_HEADER_SIZE :: 7
+MBAP_HEADER_SIZE_WITHOUT_UNIT_ID :: 6
 
 MODBUS_PROTOCOL_ID :: 0
 
@@ -120,6 +121,7 @@ MessageState :: enum {
 }
 
 ModbusExceptionCode :: enum {
+	None                   = 0x00,
 	IllegalFunction        = 0x01,
 	IllegalDataAddress     = 0x02,
 	IllegalDataValue       = 0x03,
@@ -263,10 +265,14 @@ modbus_generate_exception_answer :: proc(
 	return response
 }
 
-parse_request_frame :: proc(message: []u8) -> (ModbusRequestMessage, ModbusParserError) {
-	header, _ := parse_mbap_header(message)
-
-	payload_result := modbus_parse_payload(header, message)
+parse_request_frame :: proc(
+	header: ModbusHeader,
+	request_frame: []u8,
+) -> (
+	ModbusRequestMessage,
+	ModbusParserError,
+) {
+	payload_result := modbus_parse_payload(header, request_frame)
 
 
 	switch result in payload_result {
@@ -278,6 +284,12 @@ parse_request_frame :: proc(message: []u8) -> (ModbusRequestMessage, ModbusParse
 
 	unreachable()
 }
+
+get_functioncode_from_validated_request_frame :: proc(request_frame: []u8) -> u8 {
+	assert(len(request_frame) > 7)
+	return request_frame[FUNCTION_CODE_OFFSET_IN_FRAME]
+}
+
 handle_message :: proc(message: []u8) -> (ModbusResponseMessage, ModbusParserError) {
 	log.debugf("Raw Message: %v", message[:])
 
@@ -319,7 +331,7 @@ validate_frame_length :: proc(raw_message: []u8) -> bool {
 		.Big,
 	)
 
-	frame_size := (MBAP_HEADER_SIZE - 1) + int(length)
+	frame_size := (MBAP_HEADER_SIZE_WITHOUT_UNIT_ID) + int(length)
 	if len(raw_message) < frame_size {
 		return false
 	}
@@ -338,7 +350,7 @@ validate_frame :: proc(raw_message: []u8) -> (int, MessageState) {
 		return -1, .Invalid
 	}
 
-	frame_size := (MBAP_HEADER_SIZE - 1) + int(header.length)
+	frame_size := (MBAP_HEADER_SIZE_WITHOUT_UNIT_ID) + int(header.length)
 	if len(raw_message) < frame_size {
 		return -1, .Incomplete
 	}
@@ -399,5 +411,5 @@ modbus_response_to_frame_buffer :: proc(
 	modbus_payload_to_frame_buffer(response.args, frame_buffer)
 
 	//TODO: For now we assume that we have written the complete frame
-	return (int(response.header.length) + (MBAP_HEADER_SIZE - 1)), .None
+	return (int(response.header.length) + (MBAP_HEADER_SIZE_WITHOUT_UNIT_ID)), .None
 }
