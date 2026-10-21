@@ -1,5 +1,6 @@
 package main
 
+import "core:encoding/endian"
 import "core:log"
 import "core:net"
 import "core:os"
@@ -28,15 +29,21 @@ ConnectionAction :: enum {
 	Close,
 }
 
-try_extract_frame :: proc(connection: ^TcpConnection, request_frame: []u8) -> ConnectionAction {
+try_extract_frame :: proc(
+	connection: ^TcpConnection,
+	request_frame: []u8,
+) -> (
+	int,
+	ConnectionAction,
+) {
 	frame_size, frame_valid := modbus.validate_frame(connection.buffer[0:connection.buffer_length])
 
 	if frame_valid == .Incomplete {
-		return .Retry
+		return 0, .Retry
 	}
 
 	if frame_valid == .Invalid {
-		return .Close
+		return 0, .Close
 	}
 
 	if frame_valid == .Validated {
@@ -48,7 +55,7 @@ try_extract_frame :: proc(connection: ^TcpConnection, request_frame: []u8) -> Co
 		connection.buffer_length -= frame_size
 	}
 
-	return .Success
+	return frame_size, .Success
 }
 
 
@@ -79,15 +86,21 @@ ConnectionState :: enum {
 	Closed,
 }
 
-handle_connection :: proc(connection: ^TcpConnection, request_frame: []u8) -> ConnectionState {
+handle_connection :: proc(
+	connection: ^TcpConnection,
+	request_frame: []u8,
+) -> (
+	int,
+	ConnectionState,
+) {
 	for {
-		processing_state := try_extract_frame(connection, request_frame)
+		processed_frame_size, processing_state := try_extract_frame(connection, request_frame)
 
 		if processing_state == .Success {
-			return .Open
+			return processed_frame_size, .Open
 		}
 		if processing_state == .Close {
-			return .Aborted
+			return processed_frame_size, .Aborted
 		}
 
 		bytes_received, err_received := net.recv_tcp(
@@ -97,11 +110,11 @@ handle_connection :: proc(connection: ^TcpConnection, request_frame: []u8) -> Co
 		connection.buffer_length += bytes_received
 
 		if err_received != .None {
-			return .Aborted
+			return processed_frame_size, .Aborted
 		}
 
 		if bytes_received == 0 {
-			return .Closed
+			return processed_frame_size, .Closed
 		}
 	}
 }
@@ -135,6 +148,101 @@ initialize_tcp_connection :: proc(
 	connection.state = .Open
 	return .None
 }
+
+Datapoints :: struct {
+	holding_registers: [120]u16,
+}
+
+fc_read_holding_registers_handler :: proc(
+	server: ^Datapoints,
+	start: u16,
+	quantity: u16,
+	out_data: []u16,
+) -> modbus.ModbusExceptionCode {
+	if int(start) + int(quantity) > len(server.holding_registers) {
+		return .IllegalDataAddress
+	}
+
+	assert(
+		int(quantity) <= len(out_data),
+		"out_data buffer is too small to hold the resulting amount of registers",
+	)
+	copy_slice(out_data, server.holding_registers[start:start + quantity])
+
+	return .None
+}
+
+framewriter_generate_exception :: proc(
+	request_header: modbus.ModbusHeader,
+	function_code: u8,
+	exception: modbus.ModbusExceptionCode,
+	response_frame: []u8,
+) -> int {
+	exception_function_code: u8
+	if function_code >= 0x80 {
+		exception_function_code = function_code
+	} else {
+		exception_function_code = function_code | 0x80
+	}
+
+	mbap_length: u16 = modbus.MODBUS_EXCEPTION_FRAME_PAYLOAD_LENGTH
+
+	//Write MBAP Header
+	framewriter_write_header(request_header, mbap_length, response_frame)
+
+	//Write exception payload, all Payloads are supported.
+	response_frame[modbus.FUNCTION_CODE_OFFSET_IN_FRAME] = exception_function_code
+	response_frame[modbus.EXCEPTION_FIELD_OFFSET_IN_FRAME] = u8(exception)
+
+	return (modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID) + int(mbap_length)
+}
+
+framewriter_write_header :: proc(
+	header: modbus.ModbusHeader,
+	mbap_length: u16,
+	response_frame: []u8,
+) {
+	_ = endian.put_u16(
+		response_frame[modbus.TRANSACTION_ID_OFFSET_IN_FRAME:],
+		.Big,
+		header.transaction_id,
+	)
+	_ = endian.put_u16(
+		response_frame[modbus.PROTOCOL_ID_OFFSET_IN_FRAME:],
+		.Big,
+		header.protocol_id,
+	)
+	_ = endian.put_u16(response_frame[modbus.LENGTH_FIELD_OFFSET_IN_FRAME:], .Big, mbap_length)
+	response_frame[modbus.UNIT_ID_OFFSET_IN_FRAME] = header.unit_id
+}
+//TODO: Only works for FC 3 at the moment
+framewriter_generate_response :: proc(
+	request_header: modbus.ModbusHeader,
+	function_code: u8,
+	data: []u16,
+	response_frame: []u8,
+) -> int {
+	mbap_length: u16 = 3 + u16(len(data) * 2)
+	//Write MBAP Header
+	framewriter_write_header(request_header, mbap_length, response_frame)
+
+	//Write Payload, this is specific to the actual requested function. Currently we only support fc3
+	response_frame[modbus.FUNCTION_CODE_OFFSET_IN_FRAME] = function_code
+
+	//Write Length of data into response frame
+	//TODO: Extract the number so that the intent is clear modbus.DATA_LENGTH_OFFSET_IN_FRAME or something.
+	response_frame[8] = u8(len(data) * 2)
+
+	start_of_data_offset := 9
+	next_start := 0
+	for value in data {
+		_ = endian.put_u16(response_frame[(start_of_data_offset + next_start):], .Big, value)
+		next_start += 2
+	}
+
+	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
+}
+
 main :: proc() {
 
 	context.logger = log.create_console_logger()
@@ -162,6 +270,18 @@ main :: proc() {
 
 	log.infof("Server listening on \"%v:%v\"", address, port)
 
+	dummy_server: Datapoints = {
+		holding_registers = {},
+	}
+
+	for index in 0 ..< len(dummy_server.holding_registers) {
+		if index % 2 == 0 {
+			dummy_server.holding_registers[index] = u16(index << 8)
+		} else {
+			dummy_server.holding_registers[index] = u16(index)
+		}
+	}
+
 	connection: TcpConnection = {
 		state         = .Closed,
 		timeout       = time.Second * CONNECTION_TIMEOUT_IN_SECS,
@@ -182,7 +302,7 @@ main :: proc() {
 
 		if connection.state == .Open {
 			request_frame: [260]u8
-			next_state := handle_connection(&connection, request_frame[:])
+			frame_size, next_state := handle_connection(&connection, request_frame[:])
 			if next_state == .Aborted || next_state == .Closed {
 				log.infof("Closing connection")
 				net.close(connection.socket)
@@ -190,9 +310,105 @@ main :: proc() {
 				continue
 			}
 
-			parsed_modbus_request, parser_error := modbus.parse_request_frame(request_frame[:])
+			parsed_header, header_error := modbus.parse_mbap_header(request_frame[:frame_size])
+
+			if header_error != .None {
+				log.info("Modbus Message format incorrect, closing connection")
+				net.close(connection.socket)
+				connection.state = .Closed
+				connection.buffer = {}
+				connection.buffer_length = 0
+				continue
+			}
+
+
+			parsed_modbus_request, parser_error := modbus.parse_request_frame(
+				parsed_header,
+				request_frame[:frame_size],
+			)
+
+			if parser_error == .MessageTooShort {
+				log.info("Modbus Message format incorrect, closing connection")
+				net.close(connection.socket)
+				connection.state = .Closed
+				connection.buffer = {}
+				connection.buffer_length = 0
+				continue
+			}
+
+			request_fc := modbus.get_functioncode_from_validated_request_frame(
+				request_frame[:(modbus.FUNCTION_CODE_OFFSET_IN_FRAME + 1)],
+			)
+
+			frame: [260]u8
+			if parser_error == .UnknownFunctionCode {
+				frame_size := framewriter_generate_exception(
+					parsed_header,
+					request_fc,
+					.IllegalFunction,
+					frame[:],
+				)
+
+				tcp_send_modbus_frame(frame[:frame_size], &connection)
+			} else if parser_error == .IllegalDataAddress {
+				frame_size := framewriter_generate_exception(
+					parsed_header,
+					request_fc,
+					.IllegalDataAddress,
+					frame[:],
+				)
+
+				tcp_send_modbus_frame(frame[:frame_size], &connection)
+				continue
+			} else if parser_error == .IllegalDataValue {
+				frame_size := framewriter_generate_exception(
+					parsed_header,
+					request_fc,
+					.IllegalDataValue,
+					frame[:],
+				)
+
+				tcp_send_modbus_frame(frame[:frame_size], &connection)
+				continue
+			}
+
+			//TODO: We need a function code dispatcher to handle all possible payloads
+			//as of right now we only have fc3, so there is only one thing we need to handle
+
+			response_register_value_buffer: [125]u16
+
+			switch payload in parsed_modbus_request.args {
+			case modbus.ReadHoldingRegister:
+				exception := fc_read_holding_registers_handler(
+					&dummy_server,
+					payload.start_address,
+					payload.quantity,
+					response_register_value_buffer[:int(payload.quantity)],
+				)
+
+				if exception != .None {
+					frame_size := framewriter_generate_exception(
+						parsed_modbus_request.header,
+						parsed_modbus_request.function_code,
+						exception,
+						frame[:],
+					)
+
+					tcp_send_modbus_frame(frame[:frame_size], &connection)
+				} else {
+					frame_size := framewriter_generate_response(
+						parsed_modbus_request.header,
+						request_fc,
+						response_register_value_buffer[:int(payload.quantity)],
+						frame[:],
+					)
+
+					log.infof("Sending frame: %v", frame[:frame_size])
+					tcp_send_modbus_frame(frame[:frame_size], &connection)
+				}
+			}
+
 			log.infof("request: %v", parsed_modbus_request)
 		}
-
 	}
 }
