@@ -126,6 +126,7 @@ TcpInitializationError :: enum {
 	ConnectionRefused,
 	SetTimeoutFailure,
 }
+
 initialize_tcp_connection :: proc(
 	listening_socket: net.TCP_Socket,
 	connection: ^TcpConnection,
@@ -215,6 +216,7 @@ framewriter_write_header :: proc(
 	_ = endian.put_u16(response_frame[modbus.LENGTH_FIELD_OFFSET_IN_FRAME:], .Big, mbap_length)
 	response_frame[modbus.UNIT_ID_OFFSET_IN_FRAME] = header.unit_id
 }
+
 //TODO: Only works for FC 3 at the moment
 framewriter_generate_response :: proc(
 	request_header: modbus.ModbusHeader,
@@ -241,6 +243,15 @@ framewriter_generate_response :: proc(
 	}
 
 	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
+}
+
+tcp_connection_close :: proc(connection: ^TcpConnection) {
+	if (connection.state != .Closed) {
+		net.close(connection.socket)
+		connection.state = .Closed
+		connection.buffer = {}
+		connection.buffer_length = 0
+	}
 }
 
 main :: proc() {
@@ -305,8 +316,7 @@ main :: proc() {
 			frame_size, next_state := handle_connection(&connection, request_frame[:])
 			if next_state == .Aborted || next_state == .Closed {
 				log.infof("Closing connection")
-				net.close(connection.socket)
-				connection.state = .Closed
+				tcp_connection_close(&connection)
 				continue
 			}
 
@@ -314,10 +324,7 @@ main :: proc() {
 
 			if header_error != .None {
 				log.info("Modbus Message format incorrect, closing connection")
-				net.close(connection.socket)
-				connection.state = .Closed
-				connection.buffer = {}
-				connection.buffer_length = 0
+				tcp_connection_close(&connection)
 				continue
 			}
 
@@ -329,10 +336,7 @@ main :: proc() {
 
 			if parser_error == .MessageTooShort {
 				log.info("Modbus Message format incorrect, closing connection")
-				net.close(connection.socket)
-				connection.state = .Closed
-				connection.buffer = {}
-				connection.buffer_length = 0
+				tcp_connection_close(&connection)
 				continue
 			}
 
