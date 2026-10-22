@@ -345,34 +345,19 @@ main :: proc() {
 			)
 
 			frame: [260]u8
-			if parser_error == .UnknownFunctionCode {
+			if parser_error != .None {
 				frame_size := framewriter_generate_exception(
 					parsed_header,
 					request_fc,
-					.IllegalFunction,
+					modbus.modbus_parser_error_to_exception(parser_error),
 					frame[:],
 				)
 
-				tcp_send_modbus_frame(frame[:frame_size], &connection)
-			} else if parser_error == .IllegalDataAddress {
-				frame_size := framewriter_generate_exception(
-					parsed_header,
-					request_fc,
-					.IllegalDataAddress,
-					frame[:],
-				)
+				if !tcp_send_modbus_frame(frame[:frame_size], &connection) {
+					log.error("cannot send frame to client")
+					tcp_connection_close(&connection)
+				}
 
-				tcp_send_modbus_frame(frame[:frame_size], &connection)
-				continue
-			} else if parser_error == .IllegalDataValue {
-				frame_size := framewriter_generate_exception(
-					parsed_header,
-					request_fc,
-					.IllegalDataValue,
-					frame[:],
-				)
-
-				tcp_send_modbus_frame(frame[:frame_size], &connection)
 				continue
 			}
 
