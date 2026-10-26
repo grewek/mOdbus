@@ -433,9 +433,6 @@ main :: proc() {
 					)
 					tcp_send_modbus_frame(frame[:frame_size], &connection)
 				} else {
-					payload_echo := [2]u16{}
-					payload_echo[0] = payload.address
-					payload_echo[1] = payload.value
 					frame_size := framewriter_generate_fc6_response(
 						parsed_modbus_request.header,
 						parsed_modbus_request.function_code,
