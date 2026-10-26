@@ -173,19 +173,27 @@ fc_read_holding_registers_handler :: proc(
 	return .None
 }
 
+fc_write_single_holding_register :: proc(
+	server: ^Datapoints,
+	address: u16,
+	value: u16,
+) -> modbus.ModbusExceptionCode {
+	if int(address) >= len(server.holding_registers) {
+		return .IllegalDataAddress
+	}
+
+	server.holding_registers[address] = value
+
+	return .None
+}
+
 framewriter_generate_exception :: proc(
 	request_header: modbus.ModbusHeader,
 	function_code: u8,
 	exception: modbus.ModbusExceptionCode,
 	response_frame: []u8,
 ) -> int {
-	exception_function_code: u8
-	if function_code >= 0x80 {
-		exception_function_code = function_code
-	} else {
-		exception_function_code = function_code | 0x80
-	}
-
+	exception_function_code: u8 = function_code | 0x80
 	mbap_length: u16 = modbus.MODBUS_EXCEPTION_FRAME_PAYLOAD_LENGTH
 
 	//Write MBAP Header
@@ -218,7 +226,7 @@ framewriter_write_header :: proc(
 }
 
 //TODO: Only works for FC 3 at the moment
-framewriter_generate_response :: proc(
+framewriter_generate_fc3_response :: proc(
 	request_header: modbus.ModbusHeader,
 	function_code: u8,
 	data: []u16,
@@ -241,6 +249,23 @@ framewriter_generate_response :: proc(
 		_ = endian.put_u16(response_frame[(start_of_data_offset + next_start):], .Big, value)
 		next_start += 2
 	}
+
+	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
+}
+
+framewriter_generate_fc6_response :: proc(
+	request_header: modbus.ModbusHeader,
+	function_code: u8,
+	address: u16,
+	value: u16,
+	response_frame: []u8,
+) -> int {
+	mbap_length: u16 = 2 + 4
+	framewriter_write_header(request_header, mbap_length, response_frame)
+
+	response_frame[modbus.FUNCTION_CODE_OFFSET_IN_FRAME] = function_code
+	endian.put_u16(response_frame[8:10], .Big, address)
+	endian.put_u16(response_frame[10:12], .Big, value)
 
 	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
 }
@@ -340,15 +365,12 @@ main :: proc() {
 				continue
 			}
 
-			request_fc := modbus.get_functioncode_from_validated_request_frame(
-				request_frame[:(modbus.FUNCTION_CODE_OFFSET_IN_FRAME + 1)],
-			)
 
 			frame: [260]u8
 			if parser_error != .None {
 				frame_size := framewriter_generate_exception(
 					parsed_header,
-					request_fc,
+					parsed_modbus_request.function_code,
 					modbus.modbus_parser_error_to_exception(parser_error),
 					frame[:],
 				)
@@ -367,7 +389,7 @@ main :: proc() {
 			response_register_value_buffer: [125]u16
 
 			switch payload in parsed_modbus_request.args {
-			case modbus.ReadHoldingRegister:
+			case modbus.ModbusReadHoldingRegister:
 				exception := fc_read_holding_registers_handler(
 					&dummy_server,
 					payload.start_address,
@@ -385,9 +407,9 @@ main :: proc() {
 
 					tcp_send_modbus_frame(frame[:frame_size], &connection)
 				} else {
-					frame_size := framewriter_generate_response(
+					frame_size := framewriter_generate_fc3_response(
 						parsed_modbus_request.header,
-						request_fc,
+						parsed_modbus_request.function_code,
 						response_register_value_buffer[:int(payload.quantity)],
 						frame[:],
 					)
@@ -395,6 +417,37 @@ main :: proc() {
 					log.infof("Sending frame: %v", frame[:frame_size])
 					tcp_send_modbus_frame(frame[:frame_size], &connection)
 				}
+			case modbus.ModbusWriteSingleHoldingRegisterRequest:
+				exception := fc_write_single_holding_register(
+					&dummy_server,
+					payload.address,
+					payload.value,
+				)
+
+				if exception != .None {
+					frame_size := framewriter_generate_exception(
+						parsed_modbus_request.header,
+						parsed_modbus_request.function_code,
+						exception,
+						frame[:],
+					)
+					tcp_send_modbus_frame(frame[:frame_size], &connection)
+				} else {
+					payload_echo := [2]u16{}
+					payload_echo[0] = payload.address
+					payload_echo[1] = payload.value
+					frame_size := framewriter_generate_fc6_response(
+						parsed_modbus_request.header,
+						parsed_modbus_request.function_code,
+						payload.address,
+						payload.value,
+						frame[:],
+					)
+
+					log.infof("Sending frame: %v", frame[:frame_size])
+					tcp_send_modbus_frame(frame[:frame_size], &connection)
+				}
+
 			}
 
 			log.infof("request: %v", parsed_modbus_request)
