@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Checks Read Holding Registers (FC 0x03) responses of the Modbus TCP server.
-# Each case opens its own connection and compares the complete response
-# with the expected bytes.
+# Checks Read Holding Registers (FC 0x03) and Write Single Register (FC 0x06)
+# of the Modbus TCP server. Each case opens its own connection and compares
+# the complete response with the expected bytes.
 #
 # Usage:
 #   ./modbus_fc3_test.sh [fast|slow|pipelined|all] [host] [port]
@@ -12,6 +12,9 @@
 #   pipelined  PIPE_COUNT requests in one send. Every response must arrive,
 #              in order and with the right content.
 #   all   fast, slow and pipelined, one after the other (default).
+#
+# FC 0x06 cases run in fast and slow mode, after the FC 0x03 cases of that
+# mode. Pipelined mode covers FC 0x03 only.
 #
 # Environment variables:
 #   DELAY    Pause between pieces in seconds for slow mode   (default: 1)
@@ -38,6 +41,16 @@
 #   FC 0x03, address 119,    quantity 2     -> FC 0x83, exception 0x02
 #   FC 0x03, address 120,    quantity 1     -> FC 0x83, exception 0x02
 #   FC 0x03, address 0xFFFF, quantity 2     -> FC 0x83, exception 0x02
+#
+# Write Single Register (FC 0x06) echoes the request on success:
+#   FC 0x06, address A, value V             -> same bytes back
+# Out-of-range address (120 and up) gets exception 0x02:
+#   FC 0x06, address 120,    value 1        -> FC 0x86, exception 0x02
+#   FC 0x06, address 0xFFFF, value 1        -> FC 0x86, exception 0x02
+#
+# A valid write changes the store. Each write is read back with FC 0x03 and
+# then restored to its original value. If a run is stopped in between,
+# restart the server so the store is initialised again.
 
 set -u
 
@@ -54,6 +67,8 @@ PIPE_COUNT="${PIPE_COUNT:-80}"
 PASSED=0
 FAILED=0
 SEND_STYLE="fast"
+NEXT_TID=64      # transaction IDs for FC 0x06 cases start at 0x0040
+TID_HEX=""
 
 # Writes hex bytes like "00 01 0a" as raw bytes.
 emit() {
@@ -297,6 +312,113 @@ run_case() {
     fi
 }
 
+# Two bytes, big-endian, as hex, e.g. 4660 -> "12 34".
+hex16() {
+    printf "%02x %02x" $(( ($1 >> 8) & 0xFF )) $(( $1 & 0xFF ))
+}
+
+# Value as 0x-prefixed hex for display, e.g. 4660 -> "0x1234".
+hexval() {
+    printf "0x%04X" "$1"
+}
+
+# Sets TID_HEX to the next transaction ID and counts up.
+# Does not run in a subshell, so the counter survives.
+next_tid() {
+    TID_HEX="$(printf "%02x %02x" $(( (NEXT_TID >> 8) & 0xFF )) $(( NEXT_TID & 0xFF )))"
+    NEXT_TID=$(( NEXT_TID + 1 ))
+}
+
+# Builds a valid FC 0x03 response from explicit values.
+#   $1 transaction ID as hex bytes, e.g. "00 40"
+#   $2... values as decimal numbers, one per register
+fc3_response_values() {
+    local tid="$1"
+    shift
+    local count=$#
+    local values=""
+    local v
+
+    for v in "$@"; do
+        values+=" $(hex16 "$v")"
+    done
+
+    printf "%s 00 00 00 %02x 01 03 %02x%s" "$tid" $(( 3 + 2 * count )) $(( 2 * count )) "$values"
+}
+
+# Writes value to addr, reads back registers from read_start, then restores
+# the original value. Each step is its own connection with its own ID.
+#   $1 address
+#   $2 value (decimal)
+#   $3 start of the read-back
+#   $4 number of registers to read back
+write_and_verify() {
+    local addr="$1"
+    local value="$2"
+    local read_start="$3"
+    local read_qty="$4"
+    local original
+    local -a expected_values=()
+    local i a
+
+    original="$(register_value "$addr")"
+
+    next_tid
+    run_case "FC6 write address $addr = $(hexval "$value")" \
+        "$TID_HEX 00 00 00 06 01 06 $(hex16 "$addr") $(hex16 "$value")" \
+        "$TID_HEX 00 00 00 06 01 06 $(hex16 "$addr") $(hex16 "$value")"
+
+    for (( i = 0; i < read_qty; i++ )); do
+        a=$(( read_start + i ))
+        if (( a == addr )); then
+            expected_values+=("$value")
+        else
+            expected_values+=("$(register_value "$a")")
+        fi
+    done
+
+    next_tid
+    run_case "FC3 read back addresses $read_start to $(( read_start + read_qty - 1 )) after the write" \
+        "$TID_HEX 00 00 00 06 01 03 $(hex16 "$read_start") $(hex16 "$read_qty")" \
+        "$(fc3_response_values "$TID_HEX" "${expected_values[@]}")"
+
+    next_tid
+    run_case "FC6 restore address $addr = $(hexval "$original")" \
+        "$TID_HEX 00 00 00 06 01 06 $(hex16 "$addr") $(hex16 "$original")" \
+        "$TID_HEX 00 00 00 06 01 06 $(hex16 "$addr") $(hex16 "$original")"
+}
+
+# Write Single Register cases. Run after the FC 0x03 cases of the same mode.
+fc6_cases() {
+    # --- Valid writes, read back and restored ----------------------------
+    # Each value is written and read back together with its neighbours,
+    # so a write that touches the wrong register shows up.
+
+    write_and_verify 0 4660 0 1          # 0x1234 at the first register
+    write_and_verify 7 43981 6 3         # 0xABCD at an odd address, neighbours 6 and 8
+    write_and_verify 119 48879 118 2     # 0xBEEF at the last register
+    write_and_verify 10 23130 9 3        # 0x5A5A, neighbours 9 and 11
+    write_and_verify 3 65535 2 2         # 0xFFFF, all bits set
+
+    # --- Out-of-range addresses -------------------------------------------
+
+    next_tid
+    run_case "FC6, address 120 (first address past end)" \
+        "$TID_HEX 00 00 00 06 01 06 00 78 00 01" \
+        "$TID_HEX 00 00 00 03 01 86 02"
+
+    next_tid
+    run_case "FC6, address 0xFFFF" \
+        "$TID_HEX 00 00 00 06 01 06 ff ff 00 01" \
+        "$TID_HEX 00 00 00 03 01 86 02"
+
+    # A rejected write must not change anything. Registers 118 and 119 are read back.
+    next_tid
+    run_case "FC3 after the rejected writes, addresses 118 and 119 unchanged" \
+        "$TID_HEX 00 00 00 06 01 03 00 76 00 02" \
+        "$(fc3_response_values "$TID_HEX" "$(register_value 118)" "$(register_value 119)")"
+}
+
 # All cases, run once per send style.
 fc3_cases() {
     # --- Valid requests ---------------------------------------------------
@@ -451,11 +573,13 @@ case "$MODE" in
         SEND_STYLE="fast"
         echo; echo "##### Sent at once #####"
         fc3_cases
+        fc6_cases
         ;;
     slow)
         SEND_STYLE="slow"
         echo; echo "##### Sent in pieces #####"
         fc3_cases
+        fc6_cases
         ;;
     pipelined)
         echo; echo "##### Pipelined #####"
@@ -465,9 +589,11 @@ case "$MODE" in
         SEND_STYLE="fast"
         echo; echo "##### Sent at once #####"
         fc3_cases
+        fc6_cases
         SEND_STYLE="slow"
         echo; echo "##### Sent in pieces #####"
         fc3_cases
+        fc6_cases
         echo; echo "##### Pipelined #####"
         pipelined_case
         ;;

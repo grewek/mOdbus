@@ -19,7 +19,7 @@
 #   Request                                 Expected exception
 #   FC 0x03, quantity 0x7E (above 125)   -> FC 0x83, exception 0x03
 #   FC 0x03, quantity 0 (below 1)        -> FC 0x83, exception 0x03
-#   FC 0x06 (not implemented)            -> FC 0x86, exception 0x01
+#   FC 0x41 (not implemented)            -> FC 0xC1, exception 0x01
 
 set -u
 
@@ -107,9 +107,9 @@ run_case "Read Holding Registers, quantity 0 (below minimum)" \
     "00 02 00 00 00 06 01 03 00 00 00 00" \
     "00 02 00 00 00 03 01 83 03"
 
-run_case "Unknown function code 0x06" \
-    "00 03 00 00 00 06 01 06 00 00 00 01" \
-    "00 03 00 00 00 03 01 86 01"
+run_case "Unknown function code 0x41" \
+    "00 03 00 00 00 06 01 41 00 00 00 01" \
+    "00 03 00 00 00 03 01 c1 01"
 
 echo
 echo "Passed: $PASSED   Failed: $FAILED"
