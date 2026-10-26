@@ -23,6 +23,9 @@ EXCEPTION_FIELD_OFFSET_IN_FRAME :: 8
 QUANTITY_FIELD_OFFSET_IN_FRAME :: 10
 QUANTITY_FIELD_SIZE_IN_FRAME :: 2
 
+VALUE_FIELD_OFFSET_IN_FRAME :: 10
+VALUE_FIELD_SIZE_IN_FRAME :: 2
+
 //length of modbus response payloads with a known static size
 MODBUS_EXCEPTION_FRAME_PAYLOAD_LENGTH :: 3
 
@@ -32,10 +35,12 @@ MODBUS_HOLDING_REGISTERS_MAXIMUM_QUANTITY :: 125
 
 //constants for known request messages sizes that need to be at least n bytes long
 MINIMUM_FRAME_LENGTH_FC3_REQUEST :: 12
+MINIMUM_FRAME_LENGTH_FC6_REQUEST :: 12
 
 
 //constants for known function codes
 FUNCTION_CODE_READ_HOLDING_REGISTERS :: 3
+FUNCTION_CODE_WRITE_SINGLE_REGISTER :: 6
 
 //constants for necessary header values
 MBAP_HEADER_SIZE :: 7
@@ -74,13 +79,19 @@ ModbusResponseMessage :: struct {
 	args:          ModbusResponsePayload,
 }
 
-ReadHoldingRegister :: struct {
+ModbusReadHoldingRegister :: struct {
 	start_address: u16,
 	quantity:      u16,
 }
 
+ModbusWriteSingleHoldingRegisterRequest :: struct {
+	address: u16,
+	value:   u16,
+}
+
 ModbusRequestPayload :: union {
-	ReadHoldingRegister,
+	ModbusReadHoldingRegister,
+	ModbusWriteSingleHoldingRegisterRequest,
 }
 
 ModbusResponsePayload :: union {
@@ -91,6 +102,8 @@ ModbusResponsePayload :: union {
 ModbusReadHoldingRegisterResponse :: struct {
 	values: []u16,
 }
+
+
 ModbusException :: struct {
 	exception_code: u8,
 }
@@ -213,13 +226,13 @@ modbus_parse_payload :: proc(header: ModbusHeader, message: []u8) -> ModbusParse
 				}
 			}
 
-			raw_address := message[ADDRESS_FIELD_OFFSET_IN_FRAME:(ADDRESS_FIELD_OFFSET_IN_FRAME +
+			address_bytes := message[ADDRESS_FIELD_OFFSET_IN_FRAME:(ADDRESS_FIELD_OFFSET_IN_FRAME +
 				ADDRESS_FIELD_SIZE_IN_FRAME)]
-			start_address, _ := endian.get_u16(raw_address, .Big)
+			start_address, _ := endian.get_u16(address_bytes, .Big)
 
-			raw_quantity := message[QUANTITY_FIELD_OFFSET_IN_FRAME:(QUANTITY_FIELD_OFFSET_IN_FRAME +
+			quantity_bytes := message[QUANTITY_FIELD_OFFSET_IN_FRAME:(QUANTITY_FIELD_OFFSET_IN_FRAME +
 				QUANTITY_FIELD_SIZE_IN_FRAME)]
-			quantity, _ := endian.get_u16(raw_quantity, .Big)
+			quantity, _ := endian.get_u16(quantity_bytes, .Big)
 
 			//NOTE: According to the specification, the server can
 			// throw an exception if the address value is out of range
@@ -238,7 +251,34 @@ modbus_parse_payload :: proc(header: ModbusHeader, message: []u8) -> ModbusParse
 			return ModbusRequestMessage {
 				header = header,
 				function_code = fc,
-				args = ReadHoldingRegister{start_address = start_address, quantity = quantity},
+				args = ModbusReadHoldingRegister {
+					start_address = start_address,
+					quantity = quantity,
+				},
+			}
+		}
+	case FUNCTION_CODE_WRITE_SINGLE_REGISTER:
+		{
+			if len(message) < MINIMUM_FRAME_LENGTH_FC6_REQUEST {
+				log.info("Insufficient Bytes received to parse FC3")
+				return ModbusParserErrorMetadata {
+					header = header,
+					function_code = fc,
+					parser_error = .MessageTooShort,
+				}
+			}
+
+			address_bytes := message[ADDRESS_FIELD_OFFSET_IN_FRAME:(ADDRESS_FIELD_OFFSET_IN_FRAME +
+				ADDRESS_FIELD_SIZE_IN_FRAME)]
+			address, _ := endian.get_u16(address_bytes, .Big)
+
+			value_bytes := message[VALUE_FIELD_OFFSET_IN_FRAME:(VALUE_FIELD_OFFSET_IN_FRAME +
+				VALUE_FIELD_SIZE_IN_FRAME)]
+			value, _ := endian.get_u16(value_bytes, .Big)
+			return ModbusRequestMessage {
+				header = header,
+				function_code = fc,
+				args = ModbusWriteSingleHoldingRegisterRequest{address = address, value = value},
 			}
 		}
 	case:
@@ -274,7 +314,6 @@ parse_request_frame :: proc(
 ) {
 	payload_result := modbus_parse_payload(header, request_frame)
 
-
 	switch result in payload_result {
 	case ModbusRequestMessage:
 		return result, .None
@@ -285,40 +324,6 @@ parse_request_frame :: proc(
 	unreachable()
 }
 
-get_functioncode_from_validated_request_frame :: proc(request_frame: []u8) -> u8 {
-	assert(len(request_frame) > 7)
-	return request_frame[FUNCTION_CODE_OFFSET_IN_FRAME]
-}
-
-handle_message :: proc(message: []u8) -> (ModbusResponseMessage, ModbusParserError) {
-	log.debugf("Raw Message: %v", message[:])
-
-	//NOTE: All fields of the header contained in the frame were already
-	//      checked when the message was received so we don't need to check
-	//      that again.
-	header, _ := parse_mbap_header(message)
-	log.infof("Header of Received Message: %v", header)
-
-	payload_result := modbus_parse_payload(header, message)
-
-	switch result in payload_result {
-	case ModbusRequestMessage:
-		switch result.function_code {
-		case 3:
-			//TODO: For now we assume, that we cannot error anymore and the handler
-			// will always return a valid message.
-			assert(false, "Only validate do not create an answer here!")
-		}
-	case ModbusParserErrorMetadata:
-		if result.parser_error == .MessageTooShort {
-			return {}, result.parser_error
-		} else {
-			return modbus_generate_exception_answer(result), .None
-		}
-	}
-
-	return {}, .None
-}
 
 validate_frame_length :: proc(raw_message: []u8) -> bool {
 	if len(raw_message) < MBAP_HEADER_SIZE {
@@ -357,13 +362,4 @@ validate_frame :: proc(raw_message: []u8) -> (int, MessageState) {
 
 
 	return frame_size, .Validated
-}
-
-modbus_payload_to_frame_buffer :: proc(modbus_payload: ModbusResponsePayload, frame_buffer: []u8) {
-	switch payload in modbus_payload {
-	case ModbusReadHoldingRegisterResponse:
-		assert(false, "TODO: Fill me out once the answer is prepared!")
-	case ModbusException:
-		frame_buffer[EXCEPTION_FIELD_OFFSET_IN_FRAME] = payload.exception_code
-	}
 }
