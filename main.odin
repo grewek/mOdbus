@@ -158,39 +158,40 @@ fc_read_holding_registers_handler :: proc(
 	server: ^Datapoints,
 	start: u16,
 	quantity: u16,
-	out_data: []u16,
-) -> modbus.ModbusExceptionCode {
+) -> modbus.ModbusResponsePayload {
 	if int(start) + int(quantity) > len(server.holding_registers) {
-		return .IllegalDataAddress
+		return modbus.ModbusException {
+			function_code = modbus.FUNCTION_CODE_READ_HOLDING_REGISTERS,
+			exception_code = u8(modbus.ModbusExceptionCode.IllegalDataAddress),
+		}
 	}
 
-	assert(
-		int(quantity) <= len(out_data),
-		"out_data buffer is too small to hold the resulting amount of registers",
-	)
-	copy_slice(out_data, server.holding_registers[start:start + quantity])
-
-	return .None
+	return modbus.ModbusReadHoldingRegisterResponse {
+		values = server.holding_registers[start:(start + quantity)],
+	}
 }
 
 fc_write_single_holding_register :: proc(
 	server: ^Datapoints,
 	address: u16,
 	value: u16,
-) -> modbus.ModbusExceptionCode {
+) -> modbus.ModbusResponsePayload {
 	if int(address) >= len(server.holding_registers) {
-		return .IllegalDataAddress
+		return modbus.ModbusException {
+			function_code = modbus.FUNCTION_CODE_WRITE_SINGLE_REGISTER,
+			exception_code = u8(modbus.ModbusExceptionCode.IllegalDataAddress),
+		}
 	}
 
 	server.holding_registers[address] = value
 
-	return .None
+	return modbus.ModbusWriteSingleHoldingRegisterResponse{address = address, value = value}
 }
 
 framewriter_generate_exception :: proc(
 	request_header: modbus.ModbusHeader,
 	function_code: u8,
-	exception: modbus.ModbusExceptionCode,
+	exception: u8,
 	response_frame: []u8,
 ) -> int {
 	exception_function_code: u8 = function_code | 0x80
@@ -201,7 +202,7 @@ framewriter_generate_exception :: proc(
 
 	//Write exception payload, all Payloads are supported.
 	response_frame[modbus.FUNCTION_CODE_OFFSET_IN_FRAME] = exception_function_code
-	response_frame[modbus.EXCEPTION_FIELD_OFFSET_IN_FRAME] = u8(exception)
+	response_frame[modbus.EXCEPTION_FIELD_OFFSET_IN_FRAME] = exception
 
 	return (modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID) + int(mbap_length)
 }
@@ -279,6 +280,42 @@ tcp_connection_close :: proc(connection: ^TcpConnection) {
 	}
 }
 
+generate_response_frame :: proc(
+	header: modbus.ModbusHeader,
+	response: modbus.ModbusResponsePayload,
+	response_frame_out: []u8,
+) -> int {
+	frame_size: int = 0
+	switch payload in response {
+	case modbus.ModbusReadHoldingRegisterResponse:
+		frame_size = framewriter_generate_fc3_response(
+			header,
+			modbus.FUNCTION_CODE_READ_HOLDING_REGISTERS,
+			payload.values,
+			response_frame_out[:],
+		)
+
+	case modbus.ModbusWriteSingleHoldingRegisterResponse:
+		frame_size = framewriter_generate_fc6_response(
+			header,
+			modbus.FUNCTION_CODE_WRITE_SINGLE_REGISTER,
+			payload.address,
+			payload.value,
+			response_frame_out[:],
+		)
+
+	case modbus.ModbusException:
+		frame_size = framewriter_generate_exception(
+			header,
+			payload.function_code,
+			payload.exception_code,
+			response_frame_out[:],
+		)
+
+	}
+
+	return frame_size
+}
 main :: proc() {
 
 	context.logger = log.create_console_logger()
@@ -368,10 +405,11 @@ main :: proc() {
 
 			frame: [260]u8
 			if parser_error != .None {
+				exception_code := u8(modbus.modbus_parser_error_to_exception(parser_error))
 				frame_size := framewriter_generate_exception(
 					parsed_header,
 					parsed_modbus_request.function_code,
-					modbus.modbus_parser_error_to_exception(parser_error),
+					exception_code,
 					frame[:],
 				)
 
@@ -386,68 +424,34 @@ main :: proc() {
 			//TODO: We need a function code dispatcher to handle all possible payloads
 			//as of right now we only have fc3, so there is only one thing we need to handle
 
+			log.infof("request: %v", parsed_modbus_request)
+
 			response_register_value_buffer: [125]u16
+
+			response_payload: modbus.ModbusResponsePayload = {}
 
 			switch payload in parsed_modbus_request.args {
 			case modbus.ModbusReadHoldingRegister:
-				exception := fc_read_holding_registers_handler(
+				response_payload = fc_read_holding_registers_handler(
 					&dummy_server,
 					payload.start_address,
 					payload.quantity,
-					response_register_value_buffer[:int(payload.quantity)],
 				)
-
-				if exception != .None {
-					frame_size := framewriter_generate_exception(
-						parsed_modbus_request.header,
-						parsed_modbus_request.function_code,
-						exception,
-						frame[:],
-					)
-
-					tcp_send_modbus_frame(frame[:frame_size], &connection)
-				} else {
-					frame_size := framewriter_generate_fc3_response(
-						parsed_modbus_request.header,
-						parsed_modbus_request.function_code,
-						response_register_value_buffer[:int(payload.quantity)],
-						frame[:],
-					)
-
-					log.infof("Sending frame: %v", frame[:frame_size])
-					tcp_send_modbus_frame(frame[:frame_size], &connection)
-				}
 			case modbus.ModbusWriteSingleHoldingRegisterRequest:
-				exception := fc_write_single_holding_register(
+				response_payload = fc_write_single_holding_register(
 					&dummy_server,
 					payload.address,
 					payload.value,
 				)
-
-				if exception != .None {
-					frame_size := framewriter_generate_exception(
-						parsed_modbus_request.header,
-						parsed_modbus_request.function_code,
-						exception,
-						frame[:],
-					)
-					tcp_send_modbus_frame(frame[:frame_size], &connection)
-				} else {
-					frame_size := framewriter_generate_fc6_response(
-						parsed_modbus_request.header,
-						parsed_modbus_request.function_code,
-						payload.address,
-						payload.value,
-						frame[:],
-					)
-
-					log.infof("Sending frame: %v", frame[:frame_size])
-					tcp_send_modbus_frame(frame[:frame_size], &connection)
-				}
-
 			}
 
-			log.infof("request: %v", parsed_modbus_request)
+			response_frame_size := generate_response_frame(
+				parsed_header,
+				response_payload,
+				frame[:],
+			)
+
+			tcp_send_modbus_frame(frame[:response_frame_size], &connection)
 		}
 	}
 }
