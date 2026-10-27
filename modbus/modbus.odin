@@ -97,14 +97,21 @@ ModbusRequestPayload :: union {
 ModbusResponsePayload :: union {
 	ModbusException,
 	ModbusReadHoldingRegisterResponse,
+	ModbusWriteSingleHoldingRegisterResponse,
 }
 
 ModbusReadHoldingRegisterResponse :: struct {
 	values: []u16,
 }
 
+ModbusWriteSingleHoldingRegisterResponse :: struct {
+	address: u16,
+	value:   u16,
+}
+
 
 ModbusException :: struct {
+	function_code:  u8,
 	exception_code: u8,
 }
 
