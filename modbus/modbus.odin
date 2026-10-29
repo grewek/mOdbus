@@ -3,6 +3,9 @@ package modbus
 import "core:encoding/endian"
 import "core:log"
 
+PDU_PROLOG_SIZE :: 2
+
+
 TRANSACTION_ID_OFFSET_IN_FRAME :: 0
 TRANSACTION_ID_SIZE_IN_FRAME :: 2
 
@@ -12,8 +15,13 @@ PROTOCOL_ID_SIZE_IN_FRAME :: 2
 LENGTH_FIELD_OFFSET_IN_FRAME :: 4
 LENGTH_FIELD_SIZE_IN_FRAME :: 2
 
+LENGTH_FIELD_OFFSET_FC3_RESPONSE :: 8
+
 UNIT_ID_OFFSET_IN_FRAME :: 6
+UNIT_ID_SIZE_IN_FRAME :: 1
+
 FUNCTION_CODE_OFFSET_IN_FRAME :: 7
+FUNCTION_CODE_SIZE_IN_FRAME :: 1
 
 ADDRESS_FIELD_OFFSET_IN_FRAME :: 8
 ADDRESS_FIELD_SIZE_IN_FRAME :: 2
@@ -23,11 +31,15 @@ EXCEPTION_FIELD_OFFSET_IN_FRAME :: 8
 QUANTITY_FIELD_OFFSET_IN_FRAME :: 10
 QUANTITY_FIELD_SIZE_IN_FRAME :: 2
 
+BYTE_FIELD_OFFSET_IN_FC3_RESPONSE_FRAME :: 8
+BYTE_COUNT_FIELD_SIZE :: 1
+
 VALUE_FIELD_OFFSET_IN_FRAME :: 10
 VALUE_FIELD_SIZE_IN_FRAME :: 2
 
 //length of modbus response payloads with a known static size
 MODBUS_EXCEPTION_FRAME_PAYLOAD_LENGTH :: 3
+MODBUS_PDU_RESPONSE_LENGTH_FC6 :: 4
 
 //constants for known minimum and maximum values inside a message
 MODBUS_HOLDING_REGISTERS_MINIMUM_QUANTITY :: 1
@@ -36,7 +48,6 @@ MODBUS_HOLDING_REGISTERS_MAXIMUM_QUANTITY :: 125
 //constants for known request messages sizes that need to be at least n bytes long
 MINIMUM_FRAME_LENGTH_FC3_REQUEST :: 12
 MINIMUM_FRAME_LENGTH_FC6_REQUEST :: 12
-
 
 //constants for known function codes
 FUNCTION_CODE_READ_HOLDING_REGISTERS :: 3
@@ -79,7 +90,7 @@ ModbusResponseMessage :: struct {
 	args:          ModbusResponsePayload,
 }
 
-ModbusReadHoldingRegister :: struct {
+ModbusReadHoldingRegisterRequest :: struct {
 	start_address: u16,
 	quantity:      u16,
 }
@@ -90,7 +101,7 @@ ModbusWriteSingleHoldingRegisterRequest :: struct {
 }
 
 ModbusRequestPayload :: union {
-	ModbusReadHoldingRegister,
+	ModbusReadHoldingRegisterRequest,
 	ModbusWriteSingleHoldingRegisterRequest,
 }
 
@@ -159,6 +170,35 @@ FrameWriterError :: enum {
 	WriteFailure,
 }
 
+pack_coils :: proc(values: []bool, data_out: []u8) -> int {
+
+	shift_position: uint = 0
+	byte_index := 0
+
+	for value in values {
+		data_out[byte_index] |= (u8(value) << shift_position)
+		shift_position += 1
+
+		if shift_position == 8 {
+			shift_position = 0
+			byte_index += 1
+		}
+	}
+
+	return byte_index
+}
+
+unpack_coils :: proc(values: []u8, data_out: []bool) -> int {
+	coil_index := 0
+	for value in values {
+		for bit_index in 0 ..< 8 {
+			data_out[coil_index] = (value >> uint(bit_index) & 0x01) == 0x01
+			coil_index += 1
+		}
+	}
+
+	return coil_index
+}
 
 parse_mbap_header :: proc(message: []u8) -> (ModbusHeader, FrameHeaderError) {
 
@@ -258,7 +298,7 @@ modbus_parse_payload :: proc(header: ModbusHeader, message: []u8) -> ModbusParse
 			return ModbusRequestMessage {
 				header = header,
 				function_code = fc,
-				args = ModbusReadHoldingRegister {
+				args = ModbusReadHoldingRegisterRequest {
 					start_address = start_address,
 					quantity = quantity,
 				},
