@@ -259,51 +259,57 @@ modbus_parser_error_to_exception :: proc(parser_error: ModbusParserError) -> Mod
 	}
 }
 
+modbus_parse_fc_read_holding_registers :: proc(
+	header: ModbusHeader,
+	message: []u8,
+) -> ModbusParserOperationResult {
+	fc := message[FUNCTION_CODE_OFFSET_IN_FRAME]
+	if len(message) < MINIMUM_FRAME_LENGTH_FC3_REQUEST {
+		log.info("Insufficient Bytes received to parse FC3")
+		return ModbusParserErrorMetadata {
+			header = header,
+			function_code = fc,
+			parser_error = .MessageTooShort,
+		}
+	}
+
+	address_bytes := message[ADDRESS_FIELD_OFFSET_IN_FRAME:(ADDRESS_FIELD_OFFSET_IN_FRAME +
+		ADDRESS_FIELD_SIZE_IN_FRAME)]
+	start_address, _ := endian.get_u16(address_bytes, .Big)
+
+	quantity_bytes := message[QUANTITY_FIELD_OFFSET_IN_FRAME:(QUANTITY_FIELD_OFFSET_IN_FRAME +
+		QUANTITY_FIELD_SIZE_IN_FRAME)]
+	quantity, _ := endian.get_u16(quantity_bytes, .Big)
+
+	//NOTE: According to the specification, the server can
+	// throw an exception if the address value is out of range
+	// but in reality the range is 0x0000 to 0xFFFF which can
+	// never happen in the first place. The quantity however still
+	// needs to be checked to be less than or equal 0x7D.
+	if quantity < MODBUS_HOLDING_REGISTERS_MINIMUM_QUANTITY ||
+	   quantity > MODBUS_HOLDING_REGISTERS_MAXIMUM_QUANTITY {
+		return ModbusParserErrorMetadata {
+			header = header,
+			function_code = fc,
+			parser_error = .IllegalDataValue,
+		}
+	}
+
+	return ModbusRequestMessage {
+		header = header,
+		function_code = fc,
+		args = ModbusReadHoldingRegisterRequest {
+			start_address = start_address,
+			quantity = quantity,
+		},
+	}
+}
+
 modbus_parse_payload :: proc(header: ModbusHeader, message: []u8) -> ModbusParserOperationResult {
 	fc := message[FUNCTION_CODE_OFFSET_IN_FRAME]
 	switch fc {
 	case FUNCTION_CODE_READ_HOLDING_REGISTERS:
-		{
-			if len(message) < MINIMUM_FRAME_LENGTH_FC3_REQUEST {
-				log.info("Insufficient Bytes received to parse FC3")
-				return ModbusParserErrorMetadata {
-					header = header,
-					function_code = fc,
-					parser_error = .MessageTooShort,
-				}
-			}
-
-			address_bytes := message[ADDRESS_FIELD_OFFSET_IN_FRAME:(ADDRESS_FIELD_OFFSET_IN_FRAME +
-				ADDRESS_FIELD_SIZE_IN_FRAME)]
-			start_address, _ := endian.get_u16(address_bytes, .Big)
-
-			quantity_bytes := message[QUANTITY_FIELD_OFFSET_IN_FRAME:(QUANTITY_FIELD_OFFSET_IN_FRAME +
-				QUANTITY_FIELD_SIZE_IN_FRAME)]
-			quantity, _ := endian.get_u16(quantity_bytes, .Big)
-
-			//NOTE: According to the specification, the server can
-			// throw an exception if the address value is out of range
-			// but in reality the range is 0x0000 to 0xFFFF which can
-			// never happen in the first place. The quantity however still
-			// needs to be checked to be less than or equal 0x7D.
-			if quantity < MODBUS_HOLDING_REGISTERS_MINIMUM_QUANTITY ||
-			   quantity > MODBUS_HOLDING_REGISTERS_MAXIMUM_QUANTITY {
-				return ModbusParserErrorMetadata {
-					header = header,
-					function_code = fc,
-					parser_error = .IllegalDataValue,
-				}
-			}
-
-			return ModbusRequestMessage {
-				header = header,
-				function_code = fc,
-				args = ModbusReadHoldingRegisterRequest {
-					start_address = start_address,
-					quantity = quantity,
-				},
-			}
-		}
+		return modbus_parse_fc_read_holding_registers(header, message)
 	case FUNCTION_CODE_WRITE_SINGLE_REGISTER:
 		{
 			if len(message) < MINIMUM_FRAME_LENGTH_FC6_REQUEST {
