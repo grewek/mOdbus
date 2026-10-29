@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Checks Read Holding Registers (FC 0x03) and Write Single Register (FC 0x06)
+# Checks Read Holding Registers (FC 0x03), Read Coils (FC 0x01) and Write
+# Single Register (FC 0x06)
 # of the Modbus TCP server. Each case opens its own connection and compares
 # the complete response with the expected bytes.
 #
@@ -9,12 +10,12 @@
 #
 #   fast  Each request is sent at once.
 #   slow  Each request is sent in pieces of 5 bytes with pauses in between.
-#   pipelined  PIPE_COUNT requests in one send. Every response must arrive,
-#              in order and with the right content.
+#   pipelined  PIPE_COUNT random FC 0x03 and FC 0x06 requests in one send.
+#              Every response must arrive, in order and with the right content.
 #   all   fast, slow and pipelined, one after the other (default).
 #
-# FC 0x06 cases run in fast and slow mode, after the FC 0x03 cases of that
-# mode. Pipelined mode covers FC 0x03 only.
+# FC 0x01 and FC 0x06 cases run in fast and slow mode, after the FC 0x03 cases of that
+# mode. Pipelined mode mixes FC 0x03 and FC 0x06 requests at random.
 #
 # Environment variables:
 #   DELAY    Pause between pieces in seconds for slow mode   (default: 1)
@@ -23,6 +24,8 @@
 #   DIFF_LINES Maximum rows shown in a failure diff           (default: 20)
 #   BYTES_PER_LINE  Bytes per line in the hex output          (default: 32)
 #   PIPE_COUNT      Requests sent at once in pipelined mode   (default: 80)
+#   PIPE_SEED       Seed for the random mix in pipelined mode (default: random,
+#                   printed in the output so a run can be repeated)
 #   NC_OPTS    Options for nc. Detected automatically if unset.
 #
 # Assumption: the store is initialised like this in main:
@@ -63,6 +66,7 @@ TIMEOUT="${TIMEOUT:-10}"
 DIFF_LINES="${DIFF_LINES:-20}"
 BYTES_PER_LINE="${BYTES_PER_LINE:-32}"
 PIPE_COUNT="${PIPE_COUNT:-80}"
+PIPE_SEED="${PIPE_SEED:-$RANDOM}"
 
 PASSED=0
 FAILED=0
@@ -419,6 +423,86 @@ fc6_cases() {
         "$(fc3_response_values "$TID_HEX" "$(register_value 118)" "$(register_value 119)")"
 }
 
+# ---------------------------------------------------------------------------
+# Read Coils (FC 0x01). Coils 0 .. 1999 exist. At the moment every coil is
+# false, so every valid response is a run of zero bytes. These cases check
+# the byte count, the length and the padding, but not the bit order. That
+# needs coils set to true, which can be tested once FC 0x05 or 0x0F exists.
+
+# Valid FC 0x01 response for a read of all-false coils.
+#   $1 transaction ID as hex bytes, e.g. "00 40"
+#   $2 quantity as decimal number
+expected_fc1_all_false() {
+    local tid="$1"
+    local quantity="$2"
+    local byte_count=$(( (quantity + 7) / 8 ))
+    local zeros=""
+    local i
+
+    for (( i = 0; i < byte_count; i++ )); do
+        zeros+=" 00"
+    done
+
+    printf "%s 00 00 00 %02x 01 01 %02x%s" "$tid" $(( 3 + byte_count )) "$byte_count" "$zeros"
+}
+
+# Read Coils cases.
+fc1_cases() {
+    # --- Valid requests ---------------------------------------------------
+
+    next_tid
+    run_case "FC1, address 0, quantity 1" \
+        "$TID_HEX 00 00 00 06 01 01 00 00 00 01" \
+        "$(expected_fc1_all_false "$TID_HEX" 1)"
+
+    next_tid
+    run_case "FC1, address 0, quantity 8 (exactly one byte)" \
+        "$TID_HEX 00 00 00 06 01 01 00 00 00 08" \
+        "$(expected_fc1_all_false "$TID_HEX" 8)"
+
+    next_tid
+    run_case "FC1, address 0, quantity 9 (one bit into a second byte)" \
+        "$TID_HEX 00 00 00 06 01 01 00 00 00 09" \
+        "$(expected_fc1_all_false "$TID_HEX" 9)"
+
+    next_tid
+    run_case "FC1, address 3, quantity 10 (start not on a byte boundary)" \
+        "$TID_HEX 00 00 00 06 01 01 00 03 00 0a" \
+        "$(expected_fc1_all_false "$TID_HEX" 10)"
+
+    next_tid
+    run_case "FC1, address 1999 (last coil), quantity 1" \
+        "$TID_HEX 00 00 00 06 01 01 07 cf 00 01" \
+        "$(expected_fc1_all_false "$TID_HEX" 1)"
+
+    next_tid
+    run_case "FC1, address 0, quantity 2000 (whole coil store, 250 bytes)" \
+        "$TID_HEX 00 00 00 06 01 01 00 00 07 d0" \
+        "$(expected_fc1_all_false "$TID_HEX" 2000)"
+
+    # --- Out-of-range requests --------------------------------------------
+
+    next_tid
+    run_case "FC1, address 1, quantity 2000 (runs past end)" \
+        "$TID_HEX 00 00 00 06 01 01 00 01 07 d0" \
+        "$TID_HEX 00 00 00 03 01 81 02"
+
+    next_tid
+    run_case "FC1, address 2000 (first address past end), quantity 1" \
+        "$TID_HEX 00 00 00 06 01 01 07 d0 00 01" \
+        "$TID_HEX 00 00 00 03 01 81 02"
+
+    next_tid
+    run_case "FC1, quantity 0 (below minimum)" \
+        "$TID_HEX 00 00 00 06 01 01 00 00 00 00" \
+        "$TID_HEX 00 00 00 03 01 81 03"
+
+    next_tid
+    run_case "FC1, quantity 2001 (above maximum)" \
+        "$TID_HEX 00 00 00 06 01 01 00 00 07 d1" \
+        "$TID_HEX 00 00 00 03 01 81 03"
+}
+
 # All cases, run once per send style.
 fc3_cases() {
     # --- Valid requests ---------------------------------------------------
@@ -458,60 +542,151 @@ fc3_cases() {
         "00 0a 00 00 00 03 01 83 02"
 }
 
-# Sends PIPE_COUNT FC 0x03 requests in one send. Request i has transaction ID i
-# and reads one register, so every response is 11 bytes long. All responses
-# must arrive, in order, with the right content.
-pipelined_case() {
+# Pipelined mode: PIPE_COUNT requests in one send, a random mix of
+# FC 0x03 reads (valid and out of range) and FC 0x06 writes (valid and out of
+# range). Request i has transaction ID i.
+#
+# The generator keeps a model of the store, so every expected response is
+# known before sending. Responses differ in length, so they are split by their
+# MBAP length field, not by a fixed size.
+#
+# The random choices come from PIPE_SEED. A failing run can be repeated with
+# the same seed. Writes are undone by a second pipelined batch afterwards.
+
+declare -a BATCH_REQ=()      # request i as hex bytes, index from 1
+declare -a BATCH_EXP=()      # expected response i as hex bytes, index from 1
+declare -a MODEL_STORE=()    # model of the store, index = register address
+declare -A WRITTEN=()        # addresses changed by a successful write
+MIX_READ=0
+MIX_READ_ERR=0
+MIX_WRITE=0
+MIX_WRITE_ERR=0
+
+# Sets the model to the start values of the store.
+init_model() {
+    local a
+    MODEL_STORE=()
+    for (( a = 0; a < 120; a++ )); do
+        MODEL_STORE[a]="$(register_value "$a")"
+    done
+}
+
+# Fills BATCH_REQ and BATCH_EXP with PIPE_COUNT random requests. The model is
+# updated as each request would change the store, so reads expect the value
+# that is current at their position in the stream.
+generate_mixed_batch() {
     local count="$PIPE_COUNT"
-    local request_stream=""
-    local -a expected_chunks=()
-    local -a actual_bytes=()
-    local -a seen_order=()
-    local -A received=()
-    local i addr tid_hex addr_hex response_file
-    local total responses leftover k start tid_num chunk
-    local missing="" mismatched="" unexpected="" order_problem=""
-    local first_bad_id="" first_bad_chunk=""
+    local i tid_hex r qty start addr value
+
+    BATCH_REQ=()
+    BATCH_EXP=()
+    WRITTEN=()
+    MIX_READ=0
+    MIX_READ_ERR=0
+    MIX_WRITE=0
+    MIX_WRITE_ERR=0
+    init_model
+    RANDOM="$PIPE_SEED"
 
     for (( i = 1; i <= count; i++ )); do
-        addr=$(( (i - 1) % 120 ))
         tid_hex="$(printf "%02x %02x" $(( (i >> 8) & 0xFF )) $(( i & 0xFF )))"
-        addr_hex="$(printf "%02x %02x" $(( (addr >> 8) & 0xFF )) $(( addr & 0xFF )))"
-        request_stream+="$tid_hex 00 00 00 06 01 03 $addr_hex 00 01 "
-        expected_chunks[i]="$(expected_fc3 "$tid_hex" "$addr" 1)"
+        r=$(( RANDOM % 100 ))
+
+        if (( r < 40 )); then
+            # valid FC 0x03: start + quantity <= 120
+            qty=$(( RANDOM % 8 + 1 ))
+            start=$(( RANDOM % (121 - qty) ))
+            BATCH_REQ[i]="$tid_hex 00 00 00 06 01 03 $(hex16 "$start") $(hex16 "$qty")"
+            BATCH_EXP[i]="$(fc3_response_values "$tid_hex" "${MODEL_STORE[@]:start:qty}")"
+            MIX_READ=$(( MIX_READ + 1 ))
+        elif (( r < 50 )); then
+            # out-of-range FC 0x03: start + quantity > 120
+            qty=$(( RANDOM % 8 + 1 ))
+            start=$(( 121 - qty + RANDOM % 6 ))
+            BATCH_REQ[i]="$tid_hex 00 00 00 06 01 03 $(hex16 "$start") $(hex16 "$qty")"
+            BATCH_EXP[i]="$tid_hex 00 00 00 03 01 83 02"
+            MIX_READ_ERR=$(( MIX_READ_ERR + 1 ))
+        elif (( r < 90 )); then
+            # valid FC 0x06: address < 120, the response is an echo
+            addr=$(( RANDOM % 120 ))
+            value=$(( (RANDOM << 15 | RANDOM) & 0xFFFF ))
+            BATCH_REQ[i]="$tid_hex 00 00 00 06 01 06 $(hex16 "$addr") $(hex16 "$value")"
+            BATCH_EXP[i]="${BATCH_REQ[i]}"
+            MODEL_STORE[addr]="$value"
+            WRITTEN[$addr]=1
+            MIX_WRITE=$(( MIX_WRITE + 1 ))
+        else
+            # out-of-range FC 0x06: address 120 .. 65535
+            addr=$(( 120 + (RANDOM << 15 | RANDOM) % 65416 ))
+            value=$(( (RANDOM << 15 | RANDOM) & 0xFFFF ))
+            BATCH_REQ[i]="$tid_hex 00 00 00 06 01 06 $(hex16 "$addr") $(hex16 "$value")"
+            BATCH_EXP[i]="$tid_hex 00 00 00 03 01 86 02"
+            MIX_WRITE_ERR=$(( MIX_WRITE_ERR + 1 ))
+        fi
+    done
+}
+
+# Sends the requests in BATCH_REQ 1 .. count in one send and checks the
+# responses in BATCH_EXP.
+#   $1 label for the report
+#   $2 number of requests
+run_batch() {
+    local label="$1"
+    local count="$2"
+    local stream=""
+    local i response_file total
+    local pos=0 responses=0 leftover=0 size len tid frame k
+    local -a actual=()
+    local -a seen_order=()
+    local -A received=()
+    local missing="" mismatched="" unexpected="" order_problem=""
+    local first_bad_id="" first_bad_frame=""
+
+    for (( i = 1; i <= count; i++ )); do
+        stream+="${BATCH_REQ[i]} "
     done
 
     response_file="$(mktemp)"
 
-    { emit "$request_stream"; sleep "$HOLD"; } \
+    { emit "$stream"; sleep "$HOLD"; } \
         | timeout "$TIMEOUT" nc $NC_OPTS "$HOST" "$PORT" > "$response_file"
 
-    actual_bytes=($(od -An -tx1 -v "$response_file"))
+    actual=($(od -An -tx1 -v "$response_file"))
     rm -f "$response_file"
+    total="${#actual[@]}"
 
-    total="${#actual_bytes[@]}"
-    responses=$(( total / 11 ))
-    leftover=$(( total % 11 ))
-
-    for (( k = 0; k < responses; k++ )); do
-        start=$(( k * 11 ))
-        tid_num=$(( 16#${actual_bytes[start]} * 256 + 16#${actual_bytes[start + 1]} ))
-        seen_order+=("$tid_num")
-
-        if (( tid_num < 1 || tid_num > count )); then
-            unexpected+=" $tid_num"
-            continue
+    # Split the stream by the MBAP length field: frame size = 6 + length.
+    while (( pos < total )); do
+        if (( total - pos < 6 )); then
+            leftover=$(( total - pos ))
+            break
+        fi
+        len=$(( 16#${actual[pos + 4]} * 256 + 16#${actual[pos + 5]} ))
+        size=$(( 6 + len ))
+        if (( total - pos < size )); then
+            leftover=$(( total - pos ))
+            break
         fi
 
-        received[$tid_num]=1
-        chunk="${actual_bytes[*]:start:11}"
-        if [ "$chunk" != "${expected_chunks[tid_num]}" ]; then
-            mismatched+=" $tid_num"
-            if [ -z "$first_bad_id" ]; then
-                first_bad_id="$tid_num"
-                first_bad_chunk="$chunk"
+        tid=$(( 16#${actual[pos]} * 256 + 16#${actual[pos + 1]} ))
+        frame="${actual[*]:pos:size}"
+        responses=$(( responses + 1 ))
+        seen_order+=("$tid")
+
+        if (( tid < 1 || tid > count )); then
+            unexpected+=" $tid"
+        else
+            received[$tid]=1
+            if [ "$frame" != "${BATCH_EXP[tid]}" ]; then
+                mismatched+=" $tid"
+                if [ -z "$first_bad_id" ]; then
+                    first_bad_id="$tid"
+                    first_bad_frame="$frame"
+                fi
             fi
         fi
+
+        pos=$(( pos + size ))
     done
 
     for (( i = 1; i <= count; i++ )); do
@@ -528,7 +703,7 @@ pipelined_case() {
     done
 
     echo
-    echo "=== [pipelined] $count requests in one send"
+    echo "=== [pipelined] $label, $count requests in one send"
     if [ "$total" -eq 0 ]; then
         echo "    No response at all."
     fi
@@ -550,11 +725,43 @@ pipelined_case() {
         echo "    FAIL"
         if [ -n "$first_bad_id" ]; then
             echo "    First wrong response, ID $first_bad_id:"
-            show_diff "${expected_chunks[first_bad_id]}" "$first_bad_chunk"
+            show_diff "${BATCH_EXP[first_bad_id]}" "$first_bad_frame"
         fi
         FAILED=$((FAILED + 1))
     fi
 }
+
+# Writes the original value back to every register that a successful write
+# changed, in one pipelined batch with echo responses.
+restore_written() {
+    local addr tid_hex original n=0
+
+    BATCH_REQ=()
+    BATCH_EXP=()
+    for addr in "${!WRITTEN[@]}"; do
+        n=$(( n + 1 ))
+        tid_hex="$(printf "%02x %02x" $(( (n >> 8) & 0xFF )) $(( n & 0xFF )))"
+        original="$(register_value "$addr")"
+        BATCH_REQ[n]="$tid_hex 00 00 00 06 01 06 $(hex16 "$addr") $(hex16 "$original")"
+        BATCH_EXP[n]="${BATCH_REQ[n]}"
+    done
+
+    if (( n > 0 )); then
+        run_batch "restore $n written registers" "$n"
+    fi
+}
+
+pipelined_case() {
+    echo
+    echo "Mix of $PIPE_COUNT requests, seed $PIPE_SEED (repeat with PIPE_SEED=$PIPE_SEED)"
+    generate_mixed_batch
+    echo "    Mix: $MIX_READ valid reads, $MIX_READ_ERR out-of-range reads, $MIX_WRITE valid writes, $MIX_WRITE_ERR out-of-range writes"
+
+    run_batch "$PIPE_COUNT random requests" "$PIPE_COUNT"
+    restore_written
+}
+
+# ---------------------------------------------------------------------------
 
 usage() {
     echo "Usage: $0 [fast|slow|pipelined|all] [host] [port]"
@@ -574,12 +781,14 @@ case "$MODE" in
         echo; echo "##### Sent at once #####"
         fc3_cases
         fc6_cases
+        fc1_cases
         ;;
     slow)
         SEND_STYLE="slow"
         echo; echo "##### Sent in pieces #####"
         fc3_cases
         fc6_cases
+        fc1_cases
         ;;
     pipelined)
         echo; echo "##### Pipelined #####"
@@ -590,10 +799,12 @@ case "$MODE" in
         echo; echo "##### Sent at once #####"
         fc3_cases
         fc6_cases
+        fc1_cases
         SEND_STYLE="slow"
         echo; echo "##### Sent in pieces #####"
         fc3_cases
         fc6_cases
+        fc1_cases
         echo; echo "##### Pipelined #####"
         pipelined_case
         ;;
