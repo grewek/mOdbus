@@ -384,6 +384,8 @@ generate_response_frame :: proc(
 	return frame_size
 }
 
+//TODO(Kay): This is our Interface definition if anyone want's to create their own Server, foobar :: proc(server: ^T, request: modbus.ModbusRequestMessage) -> ModbusResponsePayload
+//           When everything is done this should be properly documented
 run_server_handler_for :: proc(
 	server: ^Datapoints,
 	request: modbus.ModbusRequestMessage,
