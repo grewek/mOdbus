@@ -42,14 +42,22 @@ MODBUS_EXCEPTION_FRAME_PAYLOAD_LENGTH :: 3
 MODBUS_PDU_RESPONSE_LENGTH_FC6 :: 4
 
 //constants for known minimum and maximum values inside a message
+
+MODBUS_COILS_MINIMUM_QUANTITY :: 1
+MODBUS_COILS_MAXIMUM_QUANTITY :: 2000
+
 MODBUS_HOLDING_REGISTERS_MINIMUM_QUANTITY :: 1
 MODBUS_HOLDING_REGISTERS_MAXIMUM_QUANTITY :: 125
 
+//TODO(Kay): Let's define a individual Frame length for each Request for now. Later on we should extract this into a singular
+//           constant where possible.
 //constants for known request messages sizes that need to be at least n bytes long
+MINIMUM_FRAME_LENGTH_FC1_REQUEST :: 12
 MINIMUM_FRAME_LENGTH_FC3_REQUEST :: 12
 MINIMUM_FRAME_LENGTH_FC6_REQUEST :: 12
 
 //constants for known function codes
+FUNCTION_CODE_READ_COILS :: 1
 FUNCTION_CODE_READ_HOLDING_REGISTERS :: 3
 FUNCTION_CODE_WRITE_SINGLE_REGISTER :: 6
 
@@ -90,6 +98,10 @@ ModbusResponseMessage :: struct {
 	args:          ModbusResponsePayload,
 }
 
+ModbusReadCoilsRequest :: struct {
+	start_address: u16,
+	quantity:      u16,
+}
 ModbusReadHoldingRegisterRequest :: struct {
 	start_address: u16,
 	quantity:      u16,
@@ -101,6 +113,7 @@ ModbusWriteSingleHoldingRegisterRequest :: struct {
 }
 
 ModbusRequestPayload :: union {
+	ModbusReadCoilsRequest,
 	ModbusReadHoldingRegisterRequest,
 	ModbusWriteSingleHoldingRegisterRequest,
 }
@@ -259,6 +272,42 @@ modbus_parser_error_to_exception :: proc(parser_error: ModbusParserError) -> Mod
 	}
 }
 
+modbus_parse_fc_read_coils :: proc(
+	header: ModbusHeader,
+	message: []u8,
+) -> ModbusParserOperationResult {
+	fc := message[FUNCTION_CODE_OFFSET_IN_FRAME]
+	if len(message) < MINIMUM_FRAME_LENGTH_FC1_REQUEST {
+		log.info("Insufficient Bytes received to parse FC3")
+		return ModbusParserErrorMetadata {
+			header = header,
+			function_code = fc,
+			parser_error = .MessageTooShort,
+		}
+	}
+
+	address_bytes := message[ADDRESS_FIELD_OFFSET_IN_FRAME:(ADDRESS_FIELD_OFFSET_IN_FRAME +
+		ADDRESS_FIELD_SIZE_IN_FRAME)]
+	start_address, _ := endian.get_u16(address_bytes, .Big)
+
+	quantity_coils_bytes := message[QUANTITY_FIELD_OFFSET_IN_FRAME:(QUANTITY_FIELD_OFFSET_IN_FRAME +
+		QUANTITY_FIELD_SIZE_IN_FRAME)]
+	quantity, _ := endian.get_u16(quantity_coils_bytes, .Big)
+
+	if quantity < MODBUS_COILS_MINIMUM_QUANTITY || quantity > MODBUS_COILS_MAXIMUM_QUANTITY {
+		return ModbusParserErrorMetadata {
+			header = header,
+			function_code = fc,
+			parser_error = .IllegalDataValue,
+		}
+	}
+
+	return ModbusRequestMessage {
+		header = header,
+		function_code = fc,
+		args = ModbusReadCoilsRequest{start_address = start_address, quantity = quantity},
+	}
+}
 modbus_parse_fc_read_holding_registers :: proc(
 	header: ModbusHeader,
 	message: []u8,
@@ -337,6 +386,8 @@ modbus_parse_fc_write_single_register :: proc(
 modbus_parse_payload :: proc(header: ModbusHeader, message: []u8) -> ModbusParserOperationResult {
 	fc := message[FUNCTION_CODE_OFFSET_IN_FRAME]
 	switch fc {
+	case FUNCTION_CODE_READ_COILS:
+		return modbus_parse_fc_read_coils(header, message)
 	case FUNCTION_CODE_READ_HOLDING_REGISTERS:
 		return modbus_parse_fc_read_holding_registers(header, message)
 	case FUNCTION_CODE_WRITE_SINGLE_REGISTER:
