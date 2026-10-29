@@ -243,6 +243,29 @@ framewriter_write_header :: proc(
 	response_frame[modbus.UNIT_ID_OFFSET_IN_FRAME] = header.unit_id
 }
 
+framewriter_generate_fc1_response :: proc(
+	request_header: modbus.ModbusHeader,
+	function_code: u8,
+	values: []bool,
+	response_frame: []u8,
+) -> int {
+	datapoints_byte_length: u8 = u8(math.ceil(f32(len(values)) / 8))
+	mbap_length: u16 =
+		modbus.UNIT_ID_OFFSET_IN_FRAME +
+		modbus.FUNCTION_CODE_OFFSET_IN_FRAME +
+		modbus.BYTE_COUNT_FIELD_SIZE +
+		u16(datapoints_byte_length)
+
+	framewriter_write_header(request_header, mbap_length, response_frame)
+	response_frame[modbus.FUNCTION_CODE_OFFSET_IN_FRAME] = function_code
+
+	response_frame[modbus.LENGTH_FIELD_OFFSET_FC3_RESPONSE] = datapoints_byte_length
+
+	modbus.pack_coils(values, response_frame[modbus.LENGTH_FIELD_OFFSET_FC3_RESPONSE + 1:])
+
+	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
+}
+
 //TODO: Only works for FC 3 at the moment
 framewriter_generate_fc3_response :: proc(
 	request_header: modbus.ModbusHeader,
@@ -276,28 +299,7 @@ framewriter_generate_fc3_response :: proc(
 	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
 }
 
-framewriter_generate_fc1_response :: proc(
-	request_header: modbus.ModbusHeader,
-	function_code: u8,
-	values: []bool,
-	response_frame: []u8,
-) -> int {
-	datapoints_byte_length: u8 = u8(math.ceil(f32(len(values)) / 8))
-	mbap_length: u16 =
-		modbus.UNIT_ID_OFFSET_IN_FRAME +
-		modbus.FUNCTION_CODE_OFFSET_IN_FRAME +
-		modbus.BYTE_COUNT_FIELD_SIZE +
-		u16(datapoints_byte_length)
 
-	framewriter_write_header(request_header, mbap_length, response_frame)
-	response_frame[modbus.FUNCTION_CODE_OFFSET_IN_FRAME] = function_code
-
-	response_frame[modbus.LENGTH_FIELD_OFFSET_FC3_RESPONSE] = datapoints_byte_length
-
-	modbus.pack_coils(values, response_frame[modbus.LENGTH_FIELD_OFFSET_FC3_RESPONSE + 1:])
-
-	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
-}
 framewriter_generate_fc6_response :: proc(
 	request_header: modbus.ModbusHeader,
 	function_code: u8,
