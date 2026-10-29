@@ -152,7 +152,7 @@ initialize_tcp_connection :: proc(
 }
 
 Datapoints :: struct {
-	coils:             [128]bool,
+	coils:             [2000]bool,
 	holding_registers: [120]u16,
 }
 
@@ -251,8 +251,8 @@ framewriter_generate_fc1_response :: proc(
 ) -> int {
 	datapoints_byte_length: u8 = u8(math.ceil(f32(len(values)) / 8))
 	mbap_length: u16 =
-		modbus.UNIT_ID_OFFSET_IN_FRAME +
-		modbus.FUNCTION_CODE_OFFSET_IN_FRAME +
+		modbus.UNIT_ID_SIZE_IN_FRAME +
+		modbus.FUNCTION_CODE_SIZE_IN_FRAME +
 		modbus.BYTE_COUNT_FIELD_SIZE +
 		u16(datapoints_byte_length)
 
@@ -383,6 +383,23 @@ generate_response_frame :: proc(
 
 	return frame_size
 }
+
+run_server_handler_for :: proc(
+	server: ^Datapoints,
+	request: modbus.ModbusRequestMessage,
+) -> modbus.ModbusResponsePayload {
+	log.infof("handling modbus request: %v", request)
+	switch payload in request.args {
+	case modbus.ModbusReadCoilsRequest:
+		return fc_read_coils(server, payload.start_address, payload.quantity)
+	case modbus.ModbusReadHoldingRegisterRequest:
+		return fc_read_holding_registers_handler(server, payload.start_address, payload.quantity)
+	case modbus.ModbusWriteSingleHoldingRegisterRequest:
+		return fc_write_single_holding_register(server, payload.address, payload.value)
+	}
+
+	unreachable()
+}
 main :: proc() {
 
 	context.logger = log.create_console_logger()
@@ -459,49 +476,32 @@ main :: proc() {
 			}
 
 
-			parsed_modbus_request, parser_error := modbus.parse_request_frame(
+			parsed_modbus_request := modbus.modbus_parse_payload(
 				parsed_header,
 				request_frame[:frame_size],
 			)
 
-			if parser_error == .MessageTooShort {
-				log.info("Modbus Message format incorrect, closing connection")
-				tcp_connection_close(&connection)
-				continue
-			}
-
 
 			response_payload: modbus.ModbusResponsePayload = {}
 
-			if parser_error != .None {
-				exception_code := u8(modbus.modbus_parser_error_to_exception(parser_error))
-				response_payload = modbus.ModbusException {
-					function_code  = parsed_modbus_request.function_code,
-					exception_code = exception_code,
+			switch payload in parsed_modbus_request {
+			case modbus.ModbusRequestMessage:
+				response_payload = run_server_handler_for(&dummy_server, payload)
+			case modbus.ModbusParserErrorMetadata:
+				if payload.parser_error == .MessageTooShort {
+					log.info("Modbus Message format incorrect, closing connection")
+					tcp_connection_close(&connection)
+					continue
+				} else {
+					exception_code := u8(
+						modbus.modbus_parser_error_to_exception(payload.parser_error),
+					)
+					response_payload = modbus.ModbusException {
+						function_code  = payload.function_code,
+						exception_code = exception_code,
+					}
 				}
 
-			} else {
-				log.infof("handling modbus request: %v", parsed_modbus_request)
-				switch payload in parsed_modbus_request.args {
-				case modbus.ModbusReadCoilsRequest:
-					response_payload = fc_read_coils(
-						&dummy_server,
-						payload.start_address,
-						payload.quantity,
-					)
-				case modbus.ModbusReadHoldingRegisterRequest:
-					response_payload = fc_read_holding_registers_handler(
-						&dummy_server,
-						payload.start_address,
-						payload.quantity,
-					)
-				case modbus.ModbusWriteSingleHoldingRegisterRequest:
-					response_payload = fc_write_single_holding_register(
-						&dummy_server,
-						payload.address,
-						payload.value,
-					)
-				}
 			}
 
 			response_frame: [260]u8
