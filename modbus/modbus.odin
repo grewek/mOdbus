@@ -120,10 +120,14 @@ ModbusRequestPayload :: union {
 
 ModbusResponsePayload :: union {
 	ModbusException,
+	ModbusReadCoilsResponse,
 	ModbusReadHoldingRegisterResponse,
 	ModbusWriteSingleHoldingRegisterResponse,
 }
 
+ModbusReadCoilsResponse :: struct {
+	values: []bool,
+}
 ModbusReadHoldingRegisterResponse :: struct {
 	values: []u16,
 }
