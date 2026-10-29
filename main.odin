@@ -2,6 +2,7 @@ package main
 
 import "core:encoding/endian"
 import "core:log"
+import "core:math"
 import "core:net"
 import "core:os"
 import "core:time"
@@ -275,6 +276,28 @@ framewriter_generate_fc3_response :: proc(
 	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
 }
 
+framewriter_generate_fc1_response :: proc(
+	request_header: modbus.ModbusHeader,
+	function_code: u8,
+	values: []bool,
+	response_frame: []u8,
+) -> int {
+	datapoints_byte_length: u8 = u8(math.ceil(f32(len(values)) / 8))
+	mbap_length: u16 =
+		modbus.UNIT_ID_OFFSET_IN_FRAME +
+		modbus.FUNCTION_CODE_OFFSET_IN_FRAME +
+		modbus.BYTE_COUNT_FIELD_SIZE +
+		u16(datapoints_byte_length)
+
+	framewriter_write_header(request_header, mbap_length, response_frame)
+	response_frame[modbus.FUNCTION_CODE_OFFSET_IN_FRAME] = function_code
+
+	response_frame[modbus.LENGTH_FIELD_OFFSET_FC3_RESPONSE] = datapoints_byte_length
+
+	modbus.pack_coils(values, response_frame[modbus.LENGTH_FIELD_OFFSET_FC3_RESPONSE + 1:])
+
+	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
+}
 framewriter_generate_fc6_response :: proc(
 	request_header: modbus.ModbusHeader,
 	function_code: u8,
@@ -322,6 +345,13 @@ generate_response_frame :: proc(
 ) -> int {
 	frame_size: int = 0
 	switch payload in response {
+	case modbus.ModbusReadCoilsResponse:
+		frame_size = framewriter_generate_fc1_response(
+			header,
+			modbus.FUNCTION_CODE_READ_COILS,
+			payload.values,
+			response_frame_out[:],
+		)
 	case modbus.ModbusReadHoldingRegisterResponse:
 		frame_size = framewriter_generate_fc3_response(
 			header,
@@ -452,7 +482,7 @@ main :: proc() {
 				switch payload in parsed_modbus_request.args {
 				case modbus.ModbusReadCoilsRequest:
 					response_payload = fc_read_coils(
-						&dummy_serever,
+						&dummy_server,
 						payload.start_address,
 						payload.quantity,
 					)
