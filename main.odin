@@ -411,6 +411,7 @@ main :: proc() {
 	log.infof("Server listening on \"%v:%v\"", address, port)
 
 	dummy_server: Datapoints = {
+		coils             = {},
 		holding_registers = {},
 	}
 
