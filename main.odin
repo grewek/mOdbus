@@ -377,7 +377,8 @@ generate_response_frame :: proc(
 			payload.exception_code,
 			response_frame_out[:],
 		)
-
+	case:
+		unreachable()
 	}
 
 	return frame_size
