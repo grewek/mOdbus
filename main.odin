@@ -2,7 +2,6 @@ package main
 
 import "core:encoding/endian"
 import "core:log"
-import "core:math"
 import "core:net"
 import "core:os"
 import "core:time"
@@ -249,7 +248,7 @@ framewriter_generate_fc1_response :: proc(
 	values: []bool,
 	response_frame: []u8,
 ) -> int {
-	datapoints_byte_length: u8 = u8(math.ceil(f32(len(values)) / 8))
+	datapoints_byte_length: u8 = u8((len(values) + 7) / 8)
 	mbap_length: u16 =
 		modbus.UNIT_ID_SIZE_IN_FRAME +
 		modbus.FUNCTION_CODE_SIZE_IN_FRAME +
@@ -484,8 +483,7 @@ main :: proc() {
 			)
 
 
-			response_payload: modbus.ModbusResponsePayload = {}
-
+			response_payload: modbus.ModbusResponsePayload
 			switch payload in parsed_modbus_request {
 			case modbus.ModbusRequestMessage:
 				response_payload = run_server_handler_for(&dummy_server, payload)
@@ -495,6 +493,8 @@ main :: proc() {
 					tcp_connection_close(&connection)
 					continue
 				} else {
+					//NOTE(Kay): The else branch is not really necessary here but it increases readability in favor of line length
+					//           so it should stay.
 					exception_code := u8(
 						modbus.modbus_parser_error_to_exception(payload.parser_error),
 					)
