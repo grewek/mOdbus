@@ -305,35 +305,42 @@ modbus_parse_fc_read_holding_registers :: proc(
 	}
 }
 
+modbus_parse_fc_write_single_register :: proc(
+	header: ModbusHeader,
+	message: []u8,
+) -> ModbusParserOperationResult {
+	fc := message[FUNCTION_CODE_OFFSET_IN_FRAME]
+
+	if len(message) < MINIMUM_FRAME_LENGTH_FC6_REQUEST {
+		log.info("Insufficient Bytes received to parse FC3")
+		return ModbusParserErrorMetadata {
+			header = header,
+			function_code = fc,
+			parser_error = .MessageTooShort,
+		}
+	}
+
+	address_bytes := message[ADDRESS_FIELD_OFFSET_IN_FRAME:(ADDRESS_FIELD_OFFSET_IN_FRAME +
+		ADDRESS_FIELD_SIZE_IN_FRAME)]
+	address, _ := endian.get_u16(address_bytes, .Big)
+
+	value_bytes := message[VALUE_FIELD_OFFSET_IN_FRAME:(VALUE_FIELD_OFFSET_IN_FRAME +
+		VALUE_FIELD_SIZE_IN_FRAME)]
+	value, _ := endian.get_u16(value_bytes, .Big)
+	return ModbusRequestMessage {
+		header = header,
+		function_code = fc,
+		args = ModbusWriteSingleHoldingRegisterRequest{address = address, value = value},
+	}
+}
+
 modbus_parse_payload :: proc(header: ModbusHeader, message: []u8) -> ModbusParserOperationResult {
 	fc := message[FUNCTION_CODE_OFFSET_IN_FRAME]
 	switch fc {
 	case FUNCTION_CODE_READ_HOLDING_REGISTERS:
 		return modbus_parse_fc_read_holding_registers(header, message)
 	case FUNCTION_CODE_WRITE_SINGLE_REGISTER:
-		{
-			if len(message) < MINIMUM_FRAME_LENGTH_FC6_REQUEST {
-				log.info("Insufficient Bytes received to parse FC3")
-				return ModbusParserErrorMetadata {
-					header = header,
-					function_code = fc,
-					parser_error = .MessageTooShort,
-				}
-			}
-
-			address_bytes := message[ADDRESS_FIELD_OFFSET_IN_FRAME:(ADDRESS_FIELD_OFFSET_IN_FRAME +
-				ADDRESS_FIELD_SIZE_IN_FRAME)]
-			address, _ := endian.get_u16(address_bytes, .Big)
-
-			value_bytes := message[VALUE_FIELD_OFFSET_IN_FRAME:(VALUE_FIELD_OFFSET_IN_FRAME +
-				VALUE_FIELD_SIZE_IN_FRAME)]
-			value, _ := endian.get_u16(value_bytes, .Big)
-			return ModbusRequestMessage {
-				header = header,
-				function_code = fc,
-				args = ModbusWriteSingleHoldingRegisterRequest{address = address, value = value},
-			}
-		}
+		return modbus_parse_fc_write_single_register(header, message)
 	case:
 		return ModbusParserErrorMetadata {
 			header = header,
