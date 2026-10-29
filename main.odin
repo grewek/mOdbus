@@ -154,6 +154,13 @@ Datapoints :: struct {
 	holding_registers: [120]u16,
 }
 
+fc_read_coils :: proc(
+	server: ^Datapoints,
+	start: u16,
+	quantity: u16,
+) -> modbus.ModbusResponsePayload {
+
+}
 fc_read_holding_registers_handler :: proc(
 	server: ^Datapoints,
 	start: u16,
@@ -434,6 +441,12 @@ main :: proc() {
 			} else {
 				log.infof("handling modbus request: %v", parsed_modbus_request)
 				switch payload in parsed_modbus_request.args {
+				case modbus.ModbusReadCoilsRequest:
+					response_payload = fc_read_coils(
+						&dummy_serever,
+						payload.start_address,
+						payload.quantity,
+					)
 				case modbus.ModbusReadHoldingRegisterRequest:
 					response_payload = fc_read_holding_registers_handler(
 						&dummy_server,
