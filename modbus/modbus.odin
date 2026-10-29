@@ -420,26 +420,6 @@ modbus_generate_exception_answer :: proc(
 	return response
 }
 
-parse_request_frame :: proc(
-	header: ModbusHeader,
-	request_frame: []u8,
-) -> (
-	ModbusRequestMessage,
-	ModbusParserError,
-) {
-	payload_result := modbus_parse_payload(header, request_frame)
-
-	switch result in payload_result {
-	case ModbusRequestMessage:
-		return result, .None
-	case ModbusParserErrorMetadata:
-		return {}, result.parser_error
-	}
-
-	unreachable()
-}
-
-
 validate_frame_length :: proc(raw_message: []u8) -> bool {
 	if len(raw_message) < MBAP_HEADER_SIZE {
 		return false
