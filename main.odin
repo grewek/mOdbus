@@ -151,6 +151,7 @@ initialize_tcp_connection :: proc(
 }
 
 Datapoints :: struct {
+	coils:             [128]bool,
 	holding_registers: [120]u16,
 }
 
@@ -159,8 +160,16 @@ fc_read_coils :: proc(
 	start: u16,
 	quantity: u16,
 ) -> modbus.ModbusResponsePayload {
+	if int(start) + int(quantity) > len(server.coils) {
+		return modbus.ModbusException {
+			function_code = modbus.FUNCTION_CODE_READ_COILS,
+			exception_code = u8(modbus.ModbusExceptionCode.IllegalDataAddress),
+		}
+	}
 
+	return modbus.ModbusReadCoilsResponse{values = server.coils[start:(start + quantity)]}
 }
+
 fc_read_holding_registers_handler :: proc(
 	server: ^Datapoints,
 	start: u16,
