@@ -233,7 +233,12 @@ framewriter_generate_fc3_response :: proc(
 	data: []u16,
 	response_frame: []u8,
 ) -> int {
-	mbap_length: u16 = 3 + u16(len(data) * 2)
+	datapoints_byte_length := u8(len(data) * 2)
+	mbap_length: u16 =
+		modbus.UNIT_ID_SIZE_IN_FRAME +
+		modbus.FUNCTION_CODE_SIZE_IN_FRAME +
+		modbus.BYTE_COUNT_FIELD_SIZE +
+		u16(datapoints_byte_length)
 	//Write MBAP Header
 	framewriter_write_header(request_header, mbap_length, response_frame)
 
@@ -242,7 +247,7 @@ framewriter_generate_fc3_response :: proc(
 
 	//Write Length of data into response frame
 	//TODO: Extract the number so that the intent is clear modbus.DATA_LENGTH_OFFSET_IN_FRAME or something.
-	response_frame[8] = u8(len(data) * 2)
+	response_frame[modbus.LENGTH_FIELD_OFFSET_FC3_RESPONSE] = datapoints_byte_length
 
 	start_of_data_offset := 9
 	next_start := 0
@@ -261,12 +266,26 @@ framewriter_generate_fc6_response :: proc(
 	value: u16,
 	response_frame: []u8,
 ) -> int {
-	mbap_length: u16 = 2 + 4
+	mbap_length: u16 =
+		modbus.UNIT_ID_SIZE_IN_FRAME +
+		modbus.FUNCTION_CODE_SIZE_IN_FRAME +
+		modbus.MODBUS_PDU_RESPONSE_LENGTH_FC6
+
 	framewriter_write_header(request_header, mbap_length, response_frame)
 
 	response_frame[modbus.FUNCTION_CODE_OFFSET_IN_FRAME] = function_code
-	endian.put_u16(response_frame[8:10], .Big, address)
-	endian.put_u16(response_frame[10:12], .Big, value)
+	_ = endian.put_u16(
+		response_frame[modbus.ADDRESS_FIELD_OFFSET_IN_FRAME:(modbus.ADDRESS_FIELD_OFFSET_IN_FRAME +
+			modbus.ADDRESS_FIELD_SIZE_IN_FRAME)],
+		.Big,
+		address,
+	)
+	_ = endian.put_u16(
+		response_frame[modbus.VALUE_FIELD_OFFSET_IN_FRAME:(modbus.VALUE_FIELD_OFFSET_IN_FRAME +
+			modbus.VALUE_FIELD_SIZE_IN_FRAME)],
+		.Big,
+		value,
+	)
 
 	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
 }
@@ -403,55 +422,41 @@ main :: proc() {
 			}
 
 
-			frame: [260]u8
-			if parser_error != .None {
-				exception_code := u8(modbus.modbus_parser_error_to_exception(parser_error))
-				frame_size := framewriter_generate_exception(
-					parsed_header,
-					parsed_modbus_request.function_code,
-					exception_code,
-					frame[:],
-				)
-
-				if !tcp_send_modbus_frame(frame[:frame_size], &connection) {
-					log.error("cannot send frame to client")
-					tcp_connection_close(&connection)
-				}
-
-				continue
-			}
-
-			//TODO: We need a function code dispatcher to handle all possible payloads
-			//as of right now we only have fc3, so there is only one thing we need to handle
-
-			log.infof("request: %v", parsed_modbus_request)
-
-			response_register_value_buffer: [125]u16
-
 			response_payload: modbus.ModbusResponsePayload = {}
 
-			switch payload in parsed_modbus_request.args {
-			case modbus.ModbusReadHoldingRegister:
-				response_payload = fc_read_holding_registers_handler(
-					&dummy_server,
-					payload.start_address,
-					payload.quantity,
-				)
-			case modbus.ModbusWriteSingleHoldingRegisterRequest:
-				response_payload = fc_write_single_holding_register(
-					&dummy_server,
-					payload.address,
-					payload.value,
-				)
+			if parser_error != .None {
+				exception_code := u8(modbus.modbus_parser_error_to_exception(parser_error))
+				response_payload = modbus.ModbusException {
+					function_code  = parsed_modbus_request.function_code,
+					exception_code = exception_code,
+				}
+
+			} else {
+				log.infof("handling modbus request: %v", parsed_modbus_request)
+				switch payload in parsed_modbus_request.args {
+				case modbus.ModbusReadHoldingRegisterRequest:
+					response_payload = fc_read_holding_registers_handler(
+						&dummy_server,
+						payload.start_address,
+						payload.quantity,
+					)
+				case modbus.ModbusWriteSingleHoldingRegisterRequest:
+					response_payload = fc_write_single_holding_register(
+						&dummy_server,
+						payload.address,
+						payload.value,
+					)
+				}
 			}
 
+			response_frame: [260]u8
 			response_frame_size := generate_response_frame(
 				parsed_header,
 				response_payload,
-				frame[:],
+				response_frame[:],
 			)
 
-			tcp_send_modbus_frame(frame[:response_frame_size], &connection)
+			tcp_send_modbus_frame(response_frame[:response_frame_size], &connection)
 		}
 	}
 }
