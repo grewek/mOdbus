@@ -187,6 +187,23 @@ fc_read_holding_registers_handler :: proc(
 	}
 }
 
+fc_write_single_coil :: proc(
+	server: ^Datapoints,
+	address: u16,
+	value: bool,
+) -> modbus.ModbusResponsePayload {
+	if int(address) >= len(server.coils) {
+		return modbus.ModbusException {
+			function_code = modbus.FUNCTION_CODE_WRITE_SINGLE_COIL,
+			exception_code = u8(modbus.ModbusExceptionCode.IllegalDataAddress),
+		}
+	}
+
+	server.coils[address] = value
+
+	return modbus.ModbusWriteSingleCoilResponse{address = address, value = value}
+}
+
 fc_write_single_holding_register :: proc(
 	server: ^Datapoints,
 	address: u16,
@@ -298,6 +315,34 @@ framewriter_generate_fc3_response :: proc(
 	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
 }
 
+framewriter_generate_fc5_response :: proc(
+	request_header: modbus.ModbusHeader,
+	function_code: u8,
+	address: u16,
+	value: bool,
+	response_frame: []u8,
+) -> int {
+	mbap_length: u16 = modbus.UNIT_ID_SIZE_IN_FRAME + modbus.FUNCTION_CODE_SIZE_IN_FRAME + 4
+
+	framewriter_write_header(request_header, mbap_length, response_frame)
+
+	response_frame[modbus.FUNCTION_CODE_OFFSET_IN_FRAME] = function_code
+	_ = endian.put_u16(
+		response_frame[modbus.ADDRESS_FIELD_OFFSET_IN_FRAME:(modbus.ADDRESS_FIELD_OFFSET_IN_FRAME +
+			modbus.ADDRESS_FIELD_SIZE_IN_FRAME)],
+		.Big,
+		address,
+	)
+
+	raw_value: u16 = value ? modbus.MODBUS_COIL_TRUE_STATE : modbus.MODBUS_COIL_FALSE_STATE
+	_ = endian.put_u16(
+		response_frame[modbus.VALUE_FIELD_OFFSET_IN_FRAME:(modbus.VALUE_FIELD_OFFSET_IN_FRAME +
+			modbus.VALUE_FIELD_SIZE_IN_FRAME)],
+		.Big,
+		raw_value,
+	)
+	return modbus.MBAP_HEADER_SIZE_WITHOUT_UNIT_ID + int(mbap_length)
+}
 
 framewriter_generate_fc6_response :: proc(
 	request_header: modbus.ModbusHeader,
@@ -360,7 +405,14 @@ generate_response_frame :: proc(
 			payload.values,
 			response_frame_out[:],
 		)
-
+	case modbus.ModbusWriteSingleCoilResponse:
+		frame_size = framewriter_generate_fc5_response(
+			header,
+			modbus.FUNCTION_CODE_WRITE_SINGLE_COIL,
+			payload.address,
+			payload.value,
+			response_frame_out[:],
+		)
 	case modbus.ModbusWriteSingleHoldingRegisterResponse:
 		frame_size = framewriter_generate_fc6_response(
 			header,
@@ -384,7 +436,10 @@ generate_response_frame :: proc(
 	return frame_size
 }
 
-//TODO(Kay): This is our Interface definition if anyone want's to create their own Server, foobar :: proc(server: ^T, request: modbus.ModbusRequestMessage) -> ModbusResponsePayload
+//TODO(Kay): This is our Interface definition if anyone wants to create their own Server
+//           the function definition has to look like this:
+//               - run_server_handler_for :: proc(server: ^T, request: modbus.ModbusRequestMessage) -> ModbusResponsePayload
+//
 //           When everything is done this should be properly documented
 run_server_handler_for :: proc(
 	server: ^Datapoints,
@@ -396,6 +451,8 @@ run_server_handler_for :: proc(
 		return fc_read_coils(server, payload.start_address, payload.quantity)
 	case modbus.ModbusReadHoldingRegisterRequest:
 		return fc_read_holding_registers_handler(server, payload.start_address, payload.quantity)
+	case modbus.ModbusWriteSingleCoilRequest:
+		return fc_write_single_coil(server, payload.address, payload.value)
 	case modbus.ModbusWriteSingleHoldingRegisterRequest:
 		return fc_write_single_holding_register(server, payload.address, payload.value)
 	}
